@@ -1,0 +1,160 @@
+{
+  "name": "search-everywhere-lite",
+  "displayName": "Search Everywhere Lite",
+  "publisher": "maor-local",
+  "version": "0.0.1",
+  "description": "Unified search (files, symbols, commands, settings) with MRU, fuzzy ranking, and quick filters.",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onCommand:searchEverywhere.open",
+    "onCommand:searchEverywhere.cycleFilter"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "searchEverywhere.open",
+        "title": "Search Everywhere: Open"
+      },
+      {
+        "command": "searchEverywhere.cycleFilter",
+        "title": "Search Everywhere: Cycle Filter"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "searchEverywhere.open",
+        "key": "cmd+shift+f"
+      },
+      {
+        "command": "searchEverywhere.cycleFilter",
+        "key": "alt+enter",
+        "when": "searchEverywhere.inQuickPick"
+      }
+    ],
+    "configuration": {
+      "title": "Search Everywhere Lite",
+      "properties": {
+        "searchEverywhere.debounceMs": {
+          "type": "number",
+          "default": 150,
+          "minimum": 0,
+          "description": "Delay (ms) before searching while typing."
+        },
+        "searchEverywhere.limits.files": {
+          "type": "number",
+          "default": 60,
+          "minimum": 1,
+          "description": "Max number of file results."
+        },
+        "searchEverywhere.limits.symbols": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "description": "Max number of symbol results."
+        },
+        "searchEverywhere.limits.commands": {
+          "type": "number",
+          "default": 80,
+          "minimum": 1,
+          "description": "Max number of command results."
+        },
+        "searchEverywhere.limits.settings": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "description": "Max number of settings results."
+        },
+        "searchEverywhere.weights.file": {
+          "type": "number",
+          "default": -3,
+          "description": "Ranking weight for file items (lower = higher)."
+        },
+        "searchEverywhere.weights.symbol": {
+          "type": "number",
+          "default": -3,
+          "description": "Ranking weight for symbol items (lower = higher)."
+        },
+        "searchEverywhere.weights.command": {
+          "type": "number",
+          "default": -1,
+          "description": "Ranking weight for command items (lower = higher)."
+        },
+        "searchEverywhere.weights.setting": {
+          "type": "number",
+          "default": 0,
+          "description": "Ranking weight for setting items (lower = higher)."
+        },
+        "searchEverywhere.enable.files": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include files source."
+        },
+        "searchEverywhere.enable.symbols": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include symbols source."
+        },
+        "searchEverywhere.enable.commands": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include commands source."
+        },
+        "searchEverywhere.enable.settings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include settings source."
+        },
+        "searchEverywhere.mru.max": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "description": "Max MRU entries to remember."
+        },
+        "searchEverywhere.mru.boostBase": {
+          "type": "number",
+          "default": -1,
+          "description": "Base MRU boost (more negative = stronger)."
+        },
+        "searchEverywhere.mru.decay": {
+          "type": "number",
+          "default": 0.1,
+          "minimum": 0,
+          "description": "MRU decay per rank (higher = faster decay)."
+        },
+        "searchEverywhere.excludes.useWorkspace": {
+          "type": "boolean",
+          "default": true,
+          "description": "Respect files.exclude and search.exclude from workspace."
+        },
+        "searchEverywhere.excludes.extra": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/out/**"
+          ],
+          "description": "Extra glob patterns to exclude."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^24.1.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.5.0"
+  }
+}
