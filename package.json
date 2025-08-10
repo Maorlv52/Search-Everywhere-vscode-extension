@@ -1,37 +1,31 @@
 {
   "name": "search-everywhere-lite",
   "displayName": "Search Everywhere Lite",
-  "publisher": "maor-local",
-  "version": "0.0.1",
-  "description": "Unified search (files, symbols, commands, settings) with MRU, fuzzy ranking, and quick filters.",
+  "publisher": "Maorlevinshtein",
+  "version": "0.1.1",
+  "description": "Text-only search with fast results, MRU, and custom WebView with context and highlighting.",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maorlevinshtein/search-everywhere-lite.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
   "main": "./out/extension.js",
-  "activationEvents": [
-    "onCommand:searchEverywhere.open",
-    "onCommand:searchEverywhere.cycleFilter"
-  ],
   "contributes": {
     "commands": [
       {
-        "command": "searchEverywhere.open",
-        "title": "Search Everywhere: Open"
-      },
-      {
-        "command": "searchEverywhere.cycleFilter",
-        "title": "Search Everywhere: Cycle Filter"
+        "command": "searchEverywhere.openCustomSearch",
+        "title": "Search Everywhere: Open Custom Search (Text Search)"
       }
     ],
     "keybindings": [
       {
-        "command": "searchEverywhere.open",
-        "key": "cmd+shift+f"
-      },
-      {
-        "command": "searchEverywhere.cycleFilter",
-        "key": "alt+enter",
-        "when": "searchEverywhere.inQuickPick"
+        "command": "searchEverywhere.openCustomSearch",
+        "key": "cmd+shift+a",
+        "mac": "cmd+shift+a",
+        "when": "editorTextFocus || !editorIsOpen"
       }
     ],
     "configuration": {
@@ -39,109 +33,9 @@
       "properties": {
         "searchEverywhere.debounceMs": {
           "type": "number",
-          "default": 150,
+          "default": 300,
           "minimum": 0,
           "description": "Delay (ms) before searching while typing."
-        },
-        "searchEverywhere.limits.files": {
-          "type": "number",
-          "default": 60,
-          "minimum": 1,
-          "description": "Max number of file results."
-        },
-        "searchEverywhere.limits.symbols": {
-          "type": "number",
-          "default": 100,
-          "minimum": 1,
-          "description": "Max number of symbol results."
-        },
-        "searchEverywhere.limits.commands": {
-          "type": "number",
-          "default": 80,
-          "minimum": 1,
-          "description": "Max number of command results."
-        },
-        "searchEverywhere.limits.settings": {
-          "type": "number",
-          "default": 50,
-          "minimum": 1,
-          "description": "Max number of settings results."
-        },
-        "searchEverywhere.weights.file": {
-          "type": "number",
-          "default": -3,
-          "description": "Ranking weight for file items (lower = higher)."
-        },
-        "searchEverywhere.weights.symbol": {
-          "type": "number",
-          "default": -3,
-          "description": "Ranking weight for symbol items (lower = higher)."
-        },
-        "searchEverywhere.weights.command": {
-          "type": "number",
-          "default": -1,
-          "description": "Ranking weight for command items (lower = higher)."
-        },
-        "searchEverywhere.weights.setting": {
-          "type": "number",
-          "default": 0,
-          "description": "Ranking weight for setting items (lower = higher)."
-        },
-        "searchEverywhere.enable.files": {
-          "type": "boolean",
-          "default": true,
-          "description": "Include files source."
-        },
-        "searchEverywhere.enable.symbols": {
-          "type": "boolean",
-          "default": true,
-          "description": "Include symbols source."
-        },
-        "searchEverywhere.enable.commands": {
-          "type": "boolean",
-          "default": true,
-          "description": "Include commands source."
-        },
-        "searchEverywhere.enable.settings": {
-          "type": "boolean",
-          "default": true,
-          "description": "Include settings source."
-        },
-        "searchEverywhere.mru.max": {
-          "type": "number",
-          "default": 100,
-          "minimum": 1,
-          "description": "Max MRU entries to remember."
-        },
-        "searchEverywhere.mru.boostBase": {
-          "type": "number",
-          "default": -1,
-          "description": "Base MRU boost (more negative = stronger)."
-        },
-        "searchEverywhere.mru.decay": {
-          "type": "number",
-          "default": 0.1,
-          "minimum": 0,
-          "description": "MRU decay per rank (higher = faster decay)."
-        },
-        "searchEverywhere.excludes.useWorkspace": {
-          "type": "boolean",
-          "default": true,
-          "description": "Respect files.exclude and search.exclude from workspace."
-        },
-        "searchEverywhere.excludes.extra": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "**/node_modules/**",
-            "**/.git/**",
-            "**/dist/**",
-            "**/build/**",
-            "**/out/**"
-          ],
-          "description": "Extra glob patterns to exclude."
         }
       }
     }
@@ -154,7 +48,58 @@
   "devDependencies": {
     "@types/node": "^24.1.0",
     "@types/vscode": "^1.85.0",
-    "@vscode/vsce": "^3.0.0",
-    "typescript": "^5.5.0"
+    "@vscode/vsce": "^3.6.0",
+    "c8": "^10.1.3",
+    "chai": "^5.2.1",
+    "eslint": "^9.32.0",
+    "mocha": "^11.7.1",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@11ty/eleventy": "^1.0.2",
+    "@11ty/eleventy-plugin-inclusive-language": "^1.0.3",
+    "@mocha/docdash": "^4.0.1",
+    "@rollup/plugin-alias": "^5.1.1",
+    "@rollup/plugin-commonjs": "^21.1.0",
+    "@rollup/plugin-json": "^4.1.0",
+    "@rollup/plugin-multi-entry": "^4.1.0",
+    "@rollup/plugin-node-resolve": "^13.3.0",
+    "@types/mocha": "^9.1.1",
+    "bumpp": "^9.11.1",
+    "coffeescript": "^2.7.0",
+    "cross-env": "^7.0.3",
+    "esbuild": "^0.25.8",
+    "eslint-plugin-n": "^17.21.3",
+    "fail-on-errors-webpack-plugin": "^3.0.0",
+    "hastscript": "^9.0.1",
+    "http-server": "^14.1.1",
+    "installed-check": "^9.3.0",
+    "jasmine": "^5.9.0",
+    "jsdoc": "^3.6.11",
+    "jsdoc-ts-utils": "^2.0.1",
+    "karma": "^6.4.4",
+    "karma-chrome-launcher": "^3.2.0",
+    "karma-mocha": "^2.0.1",
+    "karma-mocha-reporter": "^2.2.5",
+    "karma-sauce-launcher": "^4.3.6",
+    "knip": "^5.62.0",
+    "markdown-it-anchor": "^8.6.7",
+    "markdown-it-attrs": "^4.3.1",
+    "markdown-it-emoji": "^2.0.2",
+    "markdown-it-prism": "^2.3.1",
+    "markdown-toc": "^1.2.0",
+    "markdownlint-cli": "^0.30.0",
+    "needle": "^2.9.1",
+    "remark-cli": "^12.0.1",
+    "remark-preset-wooorm": "^11.0.0",
+    "rollup-plugin-copy": "^3.5.0",
+    "tm-grammars": "^1.24.1",
+    "tm-themes": "^1.10.7",
+    "tsup": "^8.5.0",
+    "tsx": "^4.20.3",
+    "type-coverage": "^2.29.7",
+    "vscode-oniguruma": "1.7.0",
+    "xo": "^0.60.0"
   }
 }

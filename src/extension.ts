@@ -1,366 +1,442 @@
 import * as vscode from 'vscode';
 
-/** ---------- Types ---------- */
-type ItemType = 'file' | 'symbol' | 'command' | 'setting';
-type FilterMode = 'all' | 'file' | 'symbol' | 'command' | 'setting';
-
-interface UnifiedItem {
-  type: ItemType;
-  label: string;
-  description?: string;
-  data: unknown;
+function escapeRegExp(str: string) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-interface Cfg {
-  debounceMs: number;
-  limits: { files: number; symbols: number; commands: number; settings: number };
-  weights: Record<ItemType, number>;
-  enable: Record<ItemType, boolean>;
-  mru: { max: number; boostBase: number; decay: number };
-  excludes: { useWorkspace: boolean; extra: string[] };
-}
 
-/** ---------- Configuration ---------- */
-function loadCfg(): Cfg {
-  const c = vscode.workspace.getConfiguration('searchEverywhere');
-  return {
-    debounceMs: c.get<number>('debounceMs', 150),
-    limits: {
-      files: c.get<number>('limits.files', 60),
-      symbols: c.get<number>('limits.symbols', 100),
-      commands: c.get<number>('limits.commands', 80),
-      settings: c.get<number>('limits.settings', 50)
-    },
-    weights: {
-      file: c.get<number>('weights.file', -3),
-      symbol: c.get<number>('weights.symbol', -3),
-      command: c.get<number>('weights.command', -1),
-      setting: c.get<number>('weights.setting', 0)
-    },
-    enable: {
-      file: c.get<boolean>('enable.files', true),
-      symbol: c.get<boolean>('enable.symbols', true),
-      command: c.get<boolean>('enable.commands', true),
-      setting: c.get<boolean>('enable.settings', true)
-    },
-    mru: {
-      max: c.get<number>('mru.max', 100),
-      boostBase: c.get<number>('mru.boostBase', -1),
-      decay: c.get<number>('mru.decay', 0.1)
-    },
-    excludes: {
-      useWorkspace: c.get<boolean>('excludes.useWorkspace', true),
-      extra: c.get<string[]>('excludes.extra', [
-        '**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/out/**'
-      ])
-    }
-  };
-}
 
-/** ---------- Utils ---------- */
-const ICON: Record<ItemType, string> = {
-  file: '$(file)',
-  symbol: '$(symbol-method)',
-  command: '$(terminal)',
-  setting: '$(gear)'
-};
-const asPromise = <T>(t: Thenable<T>): Promise<T> => Promise.resolve(t);
-
-function debounce<T extends (...args: any[]) => void>(fn: T, ms = 150) {
-  let t: NodeJS.Timeout | undefined;
-  return (...args: Parameters<T>) => {
-    if (t) clearTimeout(t);
-    t = setTimeout(() => fn(...args), ms);
-  };
-}
-
-/** ---------- MRU ---------- */
-const MRU_KEY = 'searchEverywhere.mru';
-type MRUEntry = { key: string; ts: number };
-
-const mru = {
-  load(ctx: vscode.ExtensionContext): MRUEntry[] {
-    return ctx.globalState.get<MRUEntry[]>(MRU_KEY) ?? [];
-  },
-  touch(ctx: vscode.ExtensionContext, key: string, cfg: Cfg) {
-    const now = Date.now();
-    const arr = mru.load(ctx).filter(e => e.key !== key);
-    arr.unshift({ key, ts: now });
-    ctx.globalState.update(MRU_KEY, arr.slice(0, cfg.mru.max));
-  },
-  score(ctx: vscode.ExtensionContext, key: string, cfg: Cfg): number {
-    const arr = mru.load(ctx);
-    const idx = arr.findIndex(e => e.key === key);
-    return idx < 0 ? 0 : Math.max(cfg.mru.boostBase * 5, cfg.mru.boostBase - idx * cfg.mru.decay);
-  }
-};
-
-function makeKey(it: UnifiedItem): string {
-  return `${it.type}|${it.label}|${it.description ?? ''}`;
-}
-
-/** ---------- Fuzzy ---------- */
-const isBoundary = (s: string, i: number) =>
-  i === 0 || '/_-. '.includes(s[i - 1]);
-
-function fuzzyScore(query: string, text: string): number {
-  if (!query) return 0;
-  const q = query.toLowerCase();
-  const t = text.toLowerCase();
-
-  let qi = 0, score = 0, run = 0;
-  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
-    if (t[ti] === q[qi]) {
-      const boundaryBonus = isBoundary(text, ti) ? 2 : 0;
-      const camelBonus = (text[ti] && text[ti] !== text[ti].toLowerCase()) ? 1 : 0;
-      run += 1;
-      score += 1 + run * 0.3 + boundaryBonus + camelBonus;
-      qi++;
-    } else {
-      run = 0;
-    }
-  }
-  if (qi < q.length) return 0;     // לא כל האותיות נמצאו
-  return -score;                   // שלילי = גבוה יותר בדירוג
-}
-
-/** ---------- Dispatch: open handlers ---------- */
-const openHandlers: Record<ItemType, (item: UnifiedItem) => Promise<void>> = {
-  file: async (item) => {
-    const uri = item.data as vscode.Uri;
-    await vscode.window.showTextDocument(uri, { preview: false });
-  },
-  symbol: async (item) => {
-    const loc = item.data as vscode.Location;
-    const doc = await vscode.workspace.openTextDocument(loc.uri);
-    const ed = await vscode.window.showTextDocument(doc, { preview: false });
-    ed.revealRange(loc.range, vscode.TextEditorRevealType.InCenter);
-  },
-  command: async (item) => {
-    await vscode.commands.executeCommand(item.data as string);
-  },
-  setting: async (item) => {
-    await vscode.commands.executeCommand('workbench.action.openSettings', item.data as string);
-  }
-};
-
-/** ---------- Settings candidates (basic) ---------- */
-const SETTINGS_CANDIDATES: string[] = [
-  'editor.wordWrap',
-  'editor.tabSize',
-  'files.exclude',
-  'search.exclude',
-  'typescript.tsserver.log',
-  'javascript.suggest.completeFunctionCalls'
-];
-
-/** ---------- Excludes handling ---------- */
-function buildExcludeGlob(cfg: Cfg): string {
-  const picks: string[] = [...cfg.excludes.extra];
-
-  if (cfg.excludes.useWorkspace) {
-    const filesEx = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') ?? {};
-    const searchEx = vscode.workspace.getConfiguration('search').get<Record<string, boolean>>('exclude') ?? {};
-    picks.push(
-      ...Object.entries(filesEx).filter(([, v]) => !!v).map(([k]) => k),
-      ...Object.entries(searchEx).filter(([, v]) => !!v).map(([k]) => k)
-    );
-  }
-
-  const norm = (p: string) => p.includes('*') ? p : (p.endsWith('/') ? `${p}**` : `${p}/**`);
-  const unique = Array.from(new Set(picks.map(norm)));
-  return unique.length <= 1 ? (unique[0] ?? '') : `{${unique.join(',')}}`;
-}
-
-/** ---------- Sources ---------- */
-const FILTER_ORDER: FilterMode[] = ['all', 'file', 'symbol', 'command', 'setting'];
-const FILTER_LABEL: Record<FilterMode, string> = {
-  all: 'All', file: 'Files', symbol: 'Symbols', command: 'Commands', setting: 'Settings'
-};
-
-const SOURCES: Record<FilterMode, Array<ItemType>> = {
-  all: ['file', 'symbol', 'command', 'setting'],
-  file: ['file'],
-  symbol: ['symbol'],
-  command: ['command'],
-  setting: ['setting']
-};
-
-/** ---------- Session (to avoid duplicate command registration) ---------- */
-let session: {
-  qp: vscode.QuickPick<vscode.QuickPickItem> | null;
-  mode: FilterMode;
-  refresh: (value: string) => void;
-  setTitle: () => void;
-} = {
-  qp: null,
-  mode: 'all',
-  refresh: () => {},
-  setTitle: () => {}
-};
-
-/** ---------- Entry ---------- */
 export function activate(context: vscode.ExtensionContext) {
-  let cfg = loadCfg();
+  context.subscriptions.push(
+    vscode.commands.registerCommand('searchEverywhere.openCustomSearch', async () => {
+      const panel = vscode.window.createWebviewPanel(
+        'searchEverywhereCustom',
+        'Find in Files (Text Search)',
+        vscode.ViewColumn.Active,
+        { enableScripts: true }
+      );
 
-  // האזנה לשינויים בהגדרות
-  vscode.workspace.onDidChangeConfiguration(e => {
-    if (e.affectsConfiguration('searchEverywhere')) {
-      cfg = loadCfg();
-    }
-  }, null, context.subscriptions);
+      let lastResults: { uri: vscode.Uri; line: number }[] = [];
 
-  /** register cycleFilter ONCE (fixes "already exists") */
-  const cycleFilterCmd = vscode.commands.registerCommand('searchEverywhere.cycleFilter', () => {
-    if (!session.qp) return; // no active QuickPick
-    const idx = FILTER_ORDER.indexOf(session.mode);
-    session.mode = FILTER_ORDER[(idx + 1) % FILTER_ORDER.length];
-    session.setTitle();
-    session.refresh(session.qp.value);
-  });
-  context.subscriptions.push(cycleFilterCmd);
+      panel.webview.html = getWebviewHtml();
 
-  /** open command */
-  const openCmd = vscode.commands.registerCommand('searchEverywhere.open', async () => {
-    const qp = vscode.window.createQuickPick();
-    qp.placeholder = 'Search files, symbols, commands, settings…';
-    qp.matchOnDescription = true;
+      setTimeout(() => {
+        panel.webview.postMessage({ type: 'focusSearch' });
+      }, 50);
 
-    let items: UnifiedItem[] = [];
+      panel.webview.onDidReceiveMessage(async (msg) => {
+        if (msg.type === 'doSearch') {
+          const queryRaw = (msg.query ?? '').toString().trim();
+          const query = queryRaw.toLowerCase();
+          if (!query) {
+            panel.webview.postMessage({
+              type: 'renderResults',
+              payload: { total: 0, groups: [], flatIds: [], query: queryRaw },
+            });
+            return;
+          }
 
-    // כפתורי פילטר (ימין/שמאל)
-    const prevBtn: vscode.QuickInputButton = { iconPath: new vscode.ThemeIcon('arrow-left'), tooltip: 'Previous Filter' };
-    const nextBtn: vscode.QuickInputButton = { iconPath: new vscode.ThemeIcon('arrow-right'), tooltip: 'Next Filter' };
-    qp.buttons = [prevBtn, nextBtn];
+          const matches: { uri: vscode.Uri; line: number; preview?: string }[] = [];
 
-    // הקשר לקיצור ⌥↩︎
-    await vscode.commands.executeCommand('setContext', 'searchEverywhere.inQuickPick', true);
-    qp.onDidHide(() => {
-      vscode.commands.executeCommand('setContext', 'searchEverywhere.inQuickPick', false);
-      session.qp = null; // clear session when closed
-    });
+          try {
+            const includePattern = '**/*.{ts,js,json,tsx,jsx,html,css,scss,md,txt}';
+            const excludePattern = '**/{node_modules,.git,dist,build,out}/**';
+            const uris = await vscode.workspace.findFiles(includePattern, excludePattern, 1000);
+            for (const uri of uris) {
+              try {
+                const doc = await vscode.workspace.openTextDocument(uri);
+                const text = doc.getText();
+                const lines = text.split(/\r?\n/);
+                for (let i = 0; i < lines.length; i++) {
+                  if (lines[i].toLowerCase().includes(query)) {
+                    matches.push({ uri, line: i, preview: lines[i] });
+                    if (matches.length >= 1000) break;
+                  }
+                }
+                if (matches.length >= 1000) break;
+              } catch {
+                // ignore file read errors
+              }
+            }
+          } catch (e) {
+            console.error('Error during manual search', e);
+          }
 
-    // מצב סשן לחיבור הפקודות והכפתורים
-    session.qp = qp;
-    session.mode = 'all';
-    session.setTitle = () => { qp.title = `Filter: ${FILTER_LABEL[session.mode]} (⌥↩︎)`; };
+          await enrichWithContext(matches);
 
-    const refresh = async (raw: string) => {
-      const query = raw.trim();
-      if (!query) { qp.items = []; items = []; return; }
+          lastResults = matches;
 
-      const selected = SOURCES[session.mode].filter(k => cfg.enable[k]);
-      const wants = (k: ItemType) => selected.includes(k);
+          const groupsMap = new Map<
+            string,
+            { file: string; entries: { id: number; line: number; highlightedHtml: string }[] }
+          >();
 
-      const jobs: Promise<UnifiedItem[]>[] = [];
-      const excludePattern = buildExcludeGlob(cfg);
+          const flatIds: number[] = [];
 
-      // Files
-      if (wants('file')) {
-        jobs.push(
-          asPromise(
-            vscode.workspace.findFiles(`**/*${query}*`, excludePattern || undefined, cfg.limits.files)
-              .then(uris => uris.map(uri => ({
-                type: 'file' as const,
-                label: `${ICON.file} ${uri.fsPath.split('/').pop()}`,
-                description: uri.fsPath,
-                data: uri
-              })))
-          )
-        );
-      }
+          await Promise.all(
+            matches.map(async (m, i) => {
+              const wsFolder = vscode.workspace.getWorkspaceFolder(m.uri);
+              const fileName = wsFolder
+                ? m.uri.fsPath.replace(wsFolder.uri.fsPath + '/', '')
+                : m.uri.fsPath;
 
-      // Symbols
-      if (wants('symbol')) {
-        jobs.push(
-          asPromise(
-            vscode.commands.executeCommand<any[]>('vscode.executeWorkspaceSymbolProvider', query)
-              .then(arr => (arr ?? []).slice(0, cfg.limits.symbols).map(sym => ({
-                type: 'symbol' as const,
-                label: `${ICON.symbol} ${sym.name}`,
-                description: sym.containerName || sym.location?.uri?.fsPath,
-                data: sym.location as vscode.Location
-              })))
-          ).catch<UnifiedItem[]>(() => [])
-        );
-      }
+              const group = groupsMap.get(fileName) ?? { file: fileName, entries: [] };
+              const lang = detectLangFromFile(fileName);
 
-      // Commands
-      if (wants('command')) {
-        jobs.push(
-          asPromise(
-            vscode.commands.getCommands(true).then(cmds =>
-              cmds
-                .filter((c: string) => c.toLowerCase().includes(query.toLowerCase()))
-                .slice(0, cfg.limits.commands)
-                .map((cmd: string) => ({
-                  type: 'command' as const,
-                  label: `${ICON.command} ${cmd}`,
-                  data: cmd
-                }))
-            )
-          )
-        );
-      }
+              // 1️⃣ Highlight before escaping HTML
+              const previewRaw = m.preview ?? '';
+              const highlightedRaw = previewRaw.replace(
+                new RegExp(`(${escapeRegExp(queryRaw)})`, 'gi'),
+                '<mark>$1</mark>'
+              );
 
-      // Settings
-      if (wants('setting')) {
-        const matched: UnifiedItem[] =
-          SETTINGS_CANDIDATES
-            .filter((s: string) => s.toLowerCase().includes(query.toLowerCase()))
-            .slice(0, cfg.limits.settings)
-            .map((s: string) => ({ type: 'setting' as const, label: `${ICON.setting} ${s}`, data: s }));
-        jobs.push(Promise.resolve(matched));
-      }
+              // 2️⃣ Escape HTML, but keep <mark> tags intact
+              const escapedPreview = escapeHtml(highlightedRaw)
+                .replace(/&lt;mark&gt;/g, '<mark>')
+                .replace(/&lt;\/mark&gt;/g, '</mark>');
 
-      const all = (await Promise.all(jobs)).flat();
+              // Wrap for Prism.js
+              const prismWrapped = `<pre class="preview"><code class="language-${lang}">${escapedPreview}</code></pre>`;
 
-      // דירוג: משקל סוג + Fuzzy + MRU
-      items = all
-        .map(it => {
-          const text = `${it.label} ${it.description ?? ''}`;
-          const base = cfg.weights[it.type];
-          const fuzzy = fuzzyScore(query, text);
-          const boost = mru.score(context, makeKey(it), cfg);
-          return { it, s: base + fuzzy + boost };
-        })
-        .sort((a, b) => a.s - b.s)
-        .map(x => x.it);
+              group.entries.push({ id: i, line: m.line, highlightedHtml: prismWrapped });
+              groupsMap.set(fileName, group);
+              flatIds.push(i);
+            })
+          );
 
-      qp.items = items.map(i => ({ label: i.label, description: i.description }));
-    };
 
-    // מחברים את פונקציית הריענון לסשן
-    session.refresh = (value: string) => { refresh(value); };
-
-    // כפתורים ← / →
-    qp.onDidTriggerButton(btn => {
-      if (!session.qp) return;
-      const delta = btn === nextBtn ? +1 : -1;
-      const idx = FILTER_ORDER.indexOf(session.mode);
-      session.mode = FILTER_ORDER[(idx + delta + FILTER_ORDER.length) % FILTER_ORDER.length];
-      session.setTitle();
-      session.refresh(qp.value);
-    });
-
-    qp.onDidChangeValue(debounce(refresh, cfg.debounceMs));
-
-    qp.onDidAccept(async () => {
-      const sel = qp.selectedItems[0];
-      if (!sel) return;
-      const chosen = items.find(i => i.label === sel.label && i.description === sel.description);
-      if (chosen) {
-        await openHandlers[chosen.type](chosen);
-        mru.touch(context, makeKey(chosen), cfg);
-      }
-      qp.hide();
-    });
-
-    session.setTitle();
-    qp.show();
-  });
-
-  context.subscriptions.push(openCmd);
+          panel.webview.postMessage({
+            type: 'renderResults',
+            payload: {
+              total: matches.length,
+              groups: Array.from(groupsMap.values()),
+              flatIds,
+              query: queryRaw,
+            },
+          });
+        } else if (msg.type === 'openAt') {
+          const idx = Number(msg.id);
+          if (!Number.isFinite(idx)) return;
+          const rec = lastResults[idx];
+          if (!rec) return;
+          const doc = await vscode.workspace.openTextDocument(rec.uri);
+          const ed = await vscode.window.showTextDocument(doc, { preview: false });
+          const pos = new vscode.Position(rec.line, 0);
+          ed.selection = new vscode.Selection(pos, pos);
+          ed.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+        } else if (msg.type === 'esc') {
+          panel.dispose();
+        }
+      });
+    })
+  );
 }
 
-export function deactivate() {}
+function getWebviewHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Find in Files (Text Search)</title>
+
+<!-- Prism CSS -->
+<link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+
+<style>
+pre[class*="language-"],
+code[class*="language-"] {
+  font-family: Menlo, Monaco, 'Courier New', monospace !important;
+  font-size: 12px !important;
+  line-height: 1.3 !important;
+  background: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  white-space: pre-wrap !important;
+  word-break: break-word !important;
+}
+
+pre[class*="language-"] {
+  background: none !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+body { font-family: system-ui, sans-serif; margin: 0; background: #282c34; color: #abb2bf; }
+header { padding: 12px; background: #21252b; display: flex; gap: 8px; }
+input[type="text"] { flex: 1; padding: 8px; font-size: 14px; border-radius: 4px; border: none; outline:none; }
+button { padding: 8px 12px; font-size: 14px; border-radius: 4px; border: none; cursor: pointer; background: #61afef; color: white; }
+#results { padding: 10px; }
+.fileHeader { font-weight: bold; color: #98c379; margin-top: 16px; position: sticky; top: 0; background: #21252b; padding: 4px 8px; }
+ul { list-style: none; padding: 0; margin: 0; }
+li.result { padding: 8px; border-bottom: 1px solid #3a3a3a; cursor: pointer; }
+li.result:hover, li.result.selected { background: #3e4451; }
+.line { width: 40px; display: inline-block; color: #61afef; text-align: right; margin-right: 8px; }
+.preview { display: inline-block; vertical-align: top; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+mark { background-color: #ffea00; color: black; }
+</style>
+</head>
+<body>
+<header>
+  <input id="searchInput" type="text" placeholder="Search text (case-insensitive)" autofocus />
+  <button id="searchBtn">Search</button>
+</header>
+<div id="results">Type to search…</div>
+
+<!-- Prism JS -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
+
+<script>
+const vscode = acquireVsCodeApi();
+const input = document.getElementById('searchInput');
+const btn = document.getElementById('searchBtn');
+const results = document.getElementById('results');
+
+let flatIndexToId = [];
+let selection = -1;
+
+document.addEventListener('DOMContentLoaded', () => {
+  setTimeout(() => {
+    input.focus();
+    input.select();
+  }, 50);
+});
+
+function escapeRegExp(str) {
+  return str.replace(/[.*+?\^\\\$\{\}()|[\]\\]/g, '\\$&');
+}
+
+
+
+
+
+
+function clearSelection() {
+  document.querySelectorAll('li.result.selected').forEach(el => el.classList.remove('selected'));
+  selection = -1;
+}
+
+function applySelection(index) {
+  const all = Array.from(document.querySelectorAll('li.result'));
+  if (!all.length) return;
+  selection = Math.max(0, Math.min(index, all.length - 1));
+  all.forEach(el => el.classList.remove('selected'));
+  const sel = all[selection];
+  if (sel) {
+    sel.classList.add('selected');
+    sel.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function openSelected() {
+  if (selection < 0) return;
+  const id = flatIndexToId[selection];
+  if (typeof id !== 'number') return;
+  vscode.postMessage({ type: 'openAt', id });
+  vscode.postMessage({ type: 'esc' });
+}
+
+function renderResults(data) {
+  const { total, groups, flatIds } = data;
+  results.innerHTML = '';
+  if (!total) {
+    results.textContent = 'No results';
+    clearSelection();
+    setTimeout(() => { input.focus();  }, 50);
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  groups.forEach(group => {
+    const header = document.createElement('div');
+    header.className = 'fileHeader';
+    header.textContent = group.file;
+    fragment.appendChild(header);
+
+    const ul = document.createElement('ul');
+    group.entries.forEach(entry => {
+      const li = document.createElement('li');
+      li.className = 'result';
+      li.dataset.id = String(entry.id);
+      li.innerHTML = '<span class="line">' + (entry.line + 1) + '</span>' + entry.highlightedHtml;
+      li.addEventListener('click', () => vscode.postMessage({ type: 'openAt', id: entry.id }));
+      ul.appendChild(li);
+    });
+    fragment.appendChild(ul);
+  });
+
+  results.appendChild(fragment);
+  flatIndexToId = flatIds;
+
+  Prism.highlightAll();
+
+ if (data.query) {
+  var escapedQuery = escapeRegExp(data.query);
+  var regex = new RegExp(escapedQuery, 'gi');
+
+  document.querySelectorAll('code').forEach(function(codeEl) {
+    // Step 1: Flatten Prism HTML into plain text + segment mapping
+    var segments = [];
+    var plainText = '';
+
+    (function walk(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        segments.push({ start: plainText.length, end: plainText.length + node.nodeValue.length, node: node });
+        plainText += node.nodeValue;
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        node.childNodes.forEach(walk);
+      }
+    })(codeEl);
+
+    // Step 2: Find all matches in plain text
+    var matches = [];
+    var m;
+    while ((m = regex.exec(plainText)) !== null) {
+      matches.push({ start: m.index, end: m.index + m[0].length });
+    }
+    if (!matches.length) return;
+
+    // Step 3: Wrap matches in <mark> without breaking Prism tags
+    matches.reverse().forEach(function(match) {
+      segments.forEach(function(seg) {
+        if (seg.end <= match.start || seg.start >= match.end) return; // no overlap
+        var nodeMatchStart = Math.max(seg.start, match.start) - seg.start;
+        var nodeMatchEnd = Math.min(seg.end, match.end) - seg.start;
+
+        if (nodeMatchStart < nodeMatchEnd) {
+          var text = seg.node.nodeValue;
+          var before = text.slice(0, nodeMatchStart);
+          var mid = text.slice(nodeMatchStart, nodeMatchEnd);
+          var after = text.slice(nodeMatchEnd);
+
+          var mark = document.createElement('mark');
+          mark.textContent = mid;
+
+          var frag = document.createDocumentFragment();
+          if (before) frag.appendChild(document.createTextNode(before));
+          frag.appendChild(mark);
+          if (after) frag.appendChild(document.createTextNode(after));
+
+          seg.node.parentNode.replaceChild(frag, seg.node);
+          seg.node = mark.nextSibling || mark; // update mapping
+        }
+      });
+    });
+  });
+}
+
+
+
+  const first = document.querySelector('li.result');
+  if (first) applySelection(0);
+  else clearSelection();
+  setTimeout(() => { input.focus(); }, 50);
+}
+
+let debounceTimer;
+function debounce(fn, ms) {
+  return function(...args) {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => fn(...args), ms);
+  };
+}
+
+const doSearch = () => {
+  const query = input.value.trim();
+  if (query.length === 0) {
+    results.textContent = 'Type to search…';
+    clearSelection();
+    return;
+  }
+  results.textContent = 'Searching…';
+  vscode.postMessage({ type: 'doSearch', query });
+};
+
+input.addEventListener('input', debounce(doSearch, 300));
+btn.addEventListener('click', doSearch);
+
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (selection >= 0) openSelected();
+    else doSearch();
+  }
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    const all = document.querySelectorAll('li.result');
+    if (all.length === 0) return;
+    if (selection < 0) applySelection(0);
+    else applySelection(selection + 1);
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    const all = document.querySelectorAll('li.result');
+    if (all.length === 0) return;
+    if (selection < 0) applySelection(0);
+    else applySelection(selection - 1);
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    vscode.postMessage({ type: 'esc' });
+  }
+});
+
+window.addEventListener('message', event => {
+  if (event.data.type === 'renderResults') {
+    renderResults(event.data.payload);
+  }
+});
+</script>
+</body>
+</html>`;
+}
+
+async function enrichWithContext(records: { uri: vscode.Uri; line: number; preview?: string }[]) {
+  const fileContentCache = new Map<string, string>();
+  for (const rec of records) {
+    const path = rec.uri.fsPath;
+    if (!fileContentCache.has(path)) {
+      try {
+        const doc = await vscode.workspace.openTextDocument(rec.uri);
+        fileContentCache.set(path, doc.getText());
+      } catch {
+        fileContentCache.set(path, '');
+      }
+    }
+    const text = fileContentCache.get(path) ?? '';
+    rec.preview = getContextPreview(text, rec.line, 2, 2);
+  }
+  return records;
+}
+
+function getContextPreview(text: string, line: number, before = 2, after = 2) {
+  const lines = text.split(/\r?\n/);
+  const start = Math.max(0, line - before);
+  const end = Math.min(lines.length - 1, line + after);
+  return lines.slice(start, end + 1).join('\n');
+}
+
+function escapeHtml(text: string) {
+  return text.replace(/[&<>"']/g, (m) => {
+    switch (m) {
+      case '&': return '&amp;';
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '"': return '&quot;';
+      case '\'': return '&#39;';
+      default: return m;
+    }
+  });
+}
+
+function detectLangFromFile(path: string): 'ts' | 'js' | 'json' {
+  if (path.endsWith('.ts') || path.endsWith('.tsx')) return 'ts';
+  if (path.endsWith('.js') || path.endsWith('.jsx')) return 'js';
+  if (path.endsWith('.json')) return 'json';
+  return 'ts';
+}
+
+export function deactivate() { }

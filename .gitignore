@@ -1,0 +1,41 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+pnpm-debug.log*
+npm-debug.log*
+yarn-error.log*
+
+# Build / artifacts
+out/
+dist/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# VS Code local files (keep useful project configs)
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+
+# Packaged extensions
+*.vsix
+*.tgz
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# IDEs / cache / temp
+.idea/
+.history/
+*.iml
+*.swp
+.cache/
+tmp/
+temp/

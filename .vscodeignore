@@ -1,0 +1,11 @@
+# Ignore test files and build output
+out/test/**
+node_modules/**
+.vscode/**
+.git/**
+.gitignore
+tsconfig.json
+pnpm-lock.yaml
+
+# ⚠️ DO NOT ignore media/
+# DO NOT include media/** here
