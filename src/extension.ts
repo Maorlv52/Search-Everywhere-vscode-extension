@@ -228,35 +228,60 @@ function getWebviewHtml(): string {
   --bg:#1f232a; --bg-elev:#242933; --bg-elev-2:#2b3140; --text:#cfd6e4; --muted:#8b93a7;
   --accent:#61afef; --accent-2:#98c379; --mark-bg:#ffea00; --mark-fg:#000; --border:#343a46;
 }
+
+/* base */
 *{box-sizing:border-box}
 html,body{height:100%}
 body{margin:0; background:var(--bg); color:var(--text); font:13px/1.5 ui-sans-serif,system-ui,-apple-system,Inter,Segoe UI,Roboto,Arial;}
 .app{display:grid; grid-template-rows:auto 1fr; height:100%}
-.toolbar{position:sticky; top:0; z-index:10; background:linear-gradient(180deg,var(--bg-elev) 0%,rgba(0,0,0,0) 100%); padding:10px 12px 8px; border-bottom:1px solid var(--border); backdrop-filter:saturate(1.2) blur(6px);}
-.row{display:flex; align-items:center; gap:8px}
-.inputWrap{position:relative; flex:1; display:flex; align-items:center; background:#20252f; border:1px solid var(--border); border-radius:999px; padding:4px 8px}
+
+/* toolbar container (keeps toolbar nice and compact) */
+.container{max-width: 1040px; margin: 0 auto; padding: 0 12px; width: 100%;}
+/* WIDER results container (so result panes are wider than the toolbar) */
+.containerWide{max-width: 1440px; margin: 0 auto; padding: 0 12px; width: 100%;}
+
+/* toolbar */
+.toolbar{
+  position:sticky; top:0; z-index:10;
+  background:linear-gradient(180deg,var(--bg-elev) 0%,rgba(0,0,0,0) 100%);
+  border-bottom:1px solid var(--border);
+  backdrop-filter:saturate(1.2) blur(6px);
+}
+.toolbarInner{display:flex; align-items:center; gap:10px; padding:10px 0; flex-wrap: wrap;}
+
+/* input */
+.inputWrap{
+  position:relative;
+  display:flex; align-items:center;
+  background:#20252f; border:1px solid var(--border); border-radius:999px; padding:4px 8px;
+  flex: 1 1 520px;             /* prefers ~520px but can shrink/grow */
+  min-width: 260px;            /* never smaller than this */
+  max-width: 720px;            /* never larger than this */
+}
 input[type="text"]{flex:1; font-size:14px; color:var(--text); background:transparent; border:0; outline:0; padding:6px 6px}
-.kbdHint{color:var(--muted); font-size:11.5px; margin-left:6px}
-.btn{padding:6px 10px; border:1px solid var(--border); background:var(--accent); color:#fff; border-radius:10px; font-weight:600; cursor:pointer}
+.kbdHint{color:var(--muted); font-size:11.5px; margin-left:6px; white-space:nowrap}
+
+.btn{padding:6px 10px; border:1px solid var(--border); background:var(--accent); color:#fff; border-radius:10px; font-weight:600; cursor:pointer; flex:0 0 auto}
 .btn:active{transform:translateY(1px)}
 
-/* keep original chips in DOM but hide (safety) */
+/* keep original chips (hidden) */
 .chips{display:none}
 
-/* tiny dropdowns */
-.select{position:relative}
+/* compact dropdown/selects that don't grow */
+.select{position:relative; flex:0 0 auto}
 .select > select{
   appearance:none; background:#2a3140; border:1px solid var(--border); color:var(--text);
-  border-radius:10px; padding:6px 28px 6px 10px; font-size:12px; cursor:pointer
+  border-radius:10px; padding:6px 28px 6px 10px; font-size:12px; cursor:pointer; white-space:nowrap
 }
 .select:after{
   content:'▾'; position:absolute; right:8px; top:50%; transform:translateY(-50%); font-size:11px; color:var(--muted);
 }
-/* Flags menu */
-details.menu{position:relative}
+
+/* Flags dropdown */
+details.menu{position:relative; flex:0 0 auto}
 summary.menuBtn{
   list-style:none; padding:6px 10px; border:1px solid var(--border); background:#2a3140; color:var(--text);
-  border-radius:10px; font-size:12px; cursor:pointer; user-select:none
+  border-radius:10px; font-size:12px; cursor:pointer; user-select:none; white-space:nowrap
 }
 summary.menuBtn::-webkit-details-marker{display:none}
 details[open] .menuBtn{filter:brightness(1.05)}
@@ -268,68 +293,94 @@ details[open] .menuBtn{filter:brightness(1.05)}
 .menuItem:hover{background:rgba(255,255,255,0.04)}
 .menuItem input{margin:0}
 
-.meta{margin-left:auto; display:flex; align-items:center; gap:10px; color:var(--muted)}
+/* small meta badges */
+.meta{margin-left:auto; display:flex; align-items:center; gap:10px; color:var(--muted); flex:0 0 auto}
 .meta .badge{background:#222836; border:1px solid var(--border); border-radius:999px; padding:2px 8px; color:#fff; font-size:12px}
-.results{padding:10px 12px 24px}
+
+/* results */
+.results{padding:10px 0 24px; overflow-y:auto}
 .group{border:1px solid var(--border); border-radius:10px; background:#212735; margin:8px 0 12px; overflow:hidden}
 .groupHeader{display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer; user-select:none; background:var(--bg-elev-2)}
 .groupHeader:hover{filter:brightness(1.05)}
 .groupHeader .chev{transition:transform .15s ease}
 .groupHeader[data-collapsed="true"] .chev{transform:rotate(-90deg)}
-.groupHeader .file{flex:1; font-weight:600}
+.groupHeader .file{flex:1; font-weight:600; min-width:0}
 .groupHeader .count{background:#222836; border:1px solid var(--border); border-radius:999px; padding:0 8px; font-size:12px}
 ul.entries{list-style:none; margin:0; padding:0}
-li.result{display:flex; gap:10px; align-items:flex-start; padding:8px 10px; border-top:1px solid var(--border); cursor:pointer}
+li.result{display:flex; gap:10px; align-items:flex-start; padding:12px 14px; border-top:1px solid var(--border); cursor:pointer}
 li.result:hover{background:rgba(255,255,255,0.03)}
 li.result.selected{background:rgba(97,175,239,0.12); outline:1px solid rgba(97,175,239,.4)}
 .line{width:56px; min-width:56px; text-align:right; color:var(--accent); font-variant-numeric:tabular-nums; padding-top:1px}
-.preview{flex:1; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, "Courier New", monospace; font-size:12.5px}
+
+/* keep long lines from pushing layout */
+.preview{
+  flex:1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  line-break: anywhere;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, "Courier New", monospace;
+  font-size:12.5px;
+  max-width: 100%;
+}
 mark{background-color:var(--mark-bg); color:var(--mark-fg); padding:0 2px; border-radius:3px}
 .state{color:var(--muted); padding:20px 6px}
 .small{font-size:11.5px; color:var(--muted)}
-pre[class*="language-"], code[class*="language-"]{background:none !important; margin:0 !important; padding:0 !important; line-height:1.35 !important}
+pre[class*="language-"], code[class*="language-"]{
+  background:none !important; margin:0 !important; padding:0 !important; line-height:1.35 !important;
+  white-space: inherit !important;
+  overflow-wrap: inherit !important;
+  word-break: inherit !important;
+}
 </style>
 </head>
 <body>
 <div class="app">
   <div class="toolbar">
-    <div class="row">
-      <div class="inputWrap">
-        <input id="searchInput" type="text" placeholder="Search text (case-insensitive)" autofocus />
-        <span class="kbdHint small">↵ open · ↑/↓ navigate · esc close</span>
-      </div>
-
-      <!-- Flags dropdown (new) -->
-      <details class="menu" id="flagsMenu">
-        <summary class="menuBtn">Flags ▾</summary>
-        <div class="menuList" role="menu">
-          <label class="menuItem"><input type="checkbox" id="flagCase" /> Case</label>
-          <label class="menuItem"><input type="checkbox" id="flagRegex" /> Regex</label>
-          <label class="menuItem"><input type="checkbox" id="flagWord" /> Word</label>
+    <div class="container">
+      <div class="toolbarInner">
+        <div class="inputWrap">
+          <input id="searchInput" type="text" placeholder="Search text (case-insensitive)" autofocus />
+          <span class="kbdHint small">↵ open · ↑/↓ navigate · esc close</span>
         </div>
-      </details>
 
-      <!-- Scope select (new) -->
-      <div class="select">
-        <select id="scopeSelect" title="Search in">
-          <option value="workspace" selected>Workspace</option>
-          <option value="open">Open files</option>
-          <option value="current">Current file</option>
-        </select>
-      </div>
+        <!-- Flags dropdown -->
+        <details class="menu" id="flagsMenu">
+          <summary class="menuBtn">Flags ▾</summary>
+          <div class="menuList" role="menu">
+            <label class="menuItem"><input type="checkbox" id="flagCase" /> Case</label>
+            <label class="menuItem"><input type="checkbox" id="flagRegex" /> Regex</label>
+            <label class="menuItem"><input type="checkbox" id="flagWord" /> Word</label>
+          </div>
+        </details>
 
-      <!-- keep chips node (hidden) so old logic never breaks -->
-      <div class="chips" id="chips" title="Case / Regex / Word"></div>
+        <!-- Scope select -->
+        <div class="select">
+          <select id="scopeSelect" title="Search in">
+            <option value="workspace" selected>Workspace</option>
+            <option value="open">Open files</option>
+            <option value="current">Current file</option>
+          </select>
+        </div>
 
-      <button class="btn" id="searchBtn">Search</button>
-      <div class="meta">
-        <span class="badge" id="counter">0 results</span>
-        <span class="small" id="elapsed"></span>
+        <!-- keep chips (hidden) so old logic never breaks -->
+        <div class="chips" id="chips" title="Case / Regex / Word"></div>
+
+        <button class="btn" id="searchBtn">Search</button>
+
+        <div class="meta">
+          <span class="badge" id="counter">0 results</span>
+          <span class="small" id="elapsed"></span>
+        </div>
       </div>
     </div>
   </div>
 
-  <div class="results" id="results"><div class="state">Type to search…</div></div>
+  <div class="results">
+    <div class="containerWide">
+      <div id="results"><div class="state">Type to search…</div></div>
+    </div>
+  </div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
@@ -359,7 +410,7 @@ let flatIndexToId = [];
 let selection = -1;
 let currentFlags = { case: false, regex: false, word: false };
 
-/* ---- original chips logic kept (hidden), so no runtime break ---- */
+/* ---- original chips logic kept (hidden) ---- */
 const toggles = [
   { key: 'case',  label: 'Case',  active: false },
   { key: 'regex', label: 'Regex', active: false },
@@ -391,7 +442,7 @@ const getScope = () => (el.scopeSelect && el.scopeSelect.value) ? el.scopeSelect
 document.addEventListener('DOMContentLoaded', () => {
   setTimeout(() => { el.input.focus(); el.input.select(); }, 40);
   renderChips(); // safe: chips exist but hidden
-  // defaults each open for dropdown
+  // defaults each open for dropdowns
   if (el.flagCase) { el.flagCase.checked = false; }
   if (el.flagRegex) { el.flagRegex.checked = false; }
   if (el.flagWord) { el.flagWord.checked = false; }
@@ -529,7 +580,7 @@ el.input.addEventListener('keydown', e => {
   const fn = handlers[e.key]; if(fn){ e.preventDefault(); fn(); }
 });
 
-// messages (reset chips & dropdowns each open)
+// messages (reset controls each open)
 window.addEventListener('message', event => {
   const table = {
     renderResults: () => renderResults(event.data.payload),
@@ -553,6 +604,8 @@ window.addEventListener('message', event => {
 </body>
 </html>`;
 }
+
+
 
 async function enrichWithContext(records: { uri: vscode.Uri; line: number; preview?: string }[]) {
   const fileContentCache = new Map<string, string>();
