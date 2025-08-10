@@ -18,6 +18,10 @@
       {
         "command": "searchEverywhere.openCustomSearch",
         "title": "Search Everywhere: Open Custom Search (Text Search)"
+      },
+      {
+        "command": "searchEverywhere.bindCmdShiftF",
+        "title": "Search Everywhere: Bind to ⌘⇧F (override Find in Files)"
       }
     ],
     "keybindings": [
@@ -36,8 +40,22 @@
           "default": 300,
           "minimum": 0,
           "description": "Delay (ms) before searching while typing."
+        },
+        "searchEverywhere.takeOverCmdShiftF": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, the extension will prompt to bind ⌘⇧F to Search Everywhere (user must confirm)."
         }
       }
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "searchEverywhere.bindCmdShiftF",
+          "when": "true",
+          "group": "navigation@9"
+        }
+      ]
     }
   },
   "scripts": {

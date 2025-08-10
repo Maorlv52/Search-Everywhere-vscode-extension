@@ -4,132 +4,195 @@ function escapeRegExp(str: string) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-
+const COMMANDS = {
+  open: 'searchEverywhere.openCustomSearch',
+  bindF: 'searchEverywhere.bindCmdShiftF',
+} as const;
 
 export function activate(context: vscode.ExtensionContext) {
+  // ----- OPEN CUSTOM SEARCH -----
   context.subscriptions.push(
-    vscode.commands.registerCommand('searchEverywhere.openCustomSearch', async () => {
+    vscode.commands.registerCommand(COMMANDS.open, async () => {
       const panel = vscode.window.createWebviewPanel(
         'searchEverywhereCustom',
         'Find in Files (Text Search)',
         vscode.ViewColumn.Active,
-        { enableScripts: true }
+        { enableScripts: true, retainContextWhenHidden: true }
       );
 
       let lastResults: { uri: vscode.Uri; line: number }[] = [];
-
       panel.webview.html = getWebviewHtml();
 
-      setTimeout(() => {
-        panel.webview.postMessage({ type: 'focusSearch' });
-      }, 50);
+      // initial query: selection > word under cursor > clipboard
+      const editor = vscode.window.activeTextEditor;
+      const initialQuery = await pickInitialQuery(editor);
+      panel.webview.postMessage({ type: 'init', initialQuery });
+
+      // keep focus UX
+      setTimeout(() => panel.webview.postMessage({ type: 'focusSearch' }), 50);
 
       panel.webview.onDidReceiveMessage(async (msg) => {
-        if (msg.type === 'doSearch') {
-          const queryRaw = (msg.query ?? '').toString().trim();
-          const query = queryRaw.toLowerCase();
-          if (!query) {
+        const routes: Record<string, (m: any) => Promise<void>> = {
+          async doSearch(m) {
+            const queryRaw = (m.query ?? '').toString().trim();
+            const query = queryRaw.toLowerCase();
+            if (!query) {
+              panel.webview.postMessage({
+                type: 'renderResults',
+                payload: { total: 0, groups: [], flatIds: [], query: queryRaw },
+              });
+              return;
+            }
+
+            const matches: { uri: vscode.Uri; line: number; preview?: string }[] = [];
+            try {
+              const includePattern = '**/*.{ts,js,json,tsx,jsx,html,css,scss,md,txt}';
+              const excludePattern = '**/{node_modules,.git,dist,build,out}/**';
+              const uris = await vscode.workspace.findFiles(includePattern, excludePattern, 1000);
+              for (const uri of uris) {
+                try {
+                  const doc = await vscode.workspace.openTextDocument(uri);
+                  const text = doc.getText();
+                  const lines = text.split(/\r?\n/);
+                  for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].toLowerCase().includes(query)) {
+                      matches.push({ uri, line: i, preview: lines[i] });
+                      if (matches.length >= 1000) break;
+                    }
+                  }
+                  if (matches.length >= 1000) break;
+                } catch {
+                  // ignore file read errors
+                }
+              }
+            } catch (e) {
+              console.error('Error during manual search', e);
+            }
+
+            await enrichWithContext(matches);
+            lastResults = matches;
+
+            const groupsMap = new Map<
+              string,
+              { file: string; entries: { id: number; line: number; highlightedHtml: string }[] }
+            >();
+
+            const flatIds: number[] = [];
+
+            await Promise.all(
+              matches.map(async (m, i) => {
+                const wsFolder = vscode.workspace.getWorkspaceFolder(m.uri);
+                const fileName = wsFolder
+                  ? m.uri.fsPath.replace(wsFolder.uri.fsPath + '/', '')
+                  : m.uri.fsPath;
+
+                const group = groupsMap.get(fileName) ?? { file: fileName, entries: [] };
+                const lang = detectLangFromFile(fileName);
+
+                // highlight before escaping HTML
+                const previewRaw = m.preview ?? '';
+                const highlightedRaw = previewRaw.replace(
+                  new RegExp(`(${escapeRegExp(queryRaw)})`, 'gi'),
+                  '<mark>$1</mark>'
+                );
+
+                // escape HTML, keep <mark>
+                const escapedPreview = escapeHtml(highlightedRaw)
+                  .replace(/&lt;mark&gt;/g, '<mark>')
+                  .replace(/&lt;\/mark&gt;/g, '</mark>');
+
+                const prismWrapped = `<pre class="preview"><code class="language-${lang}">${escapedPreview}</code></pre>`;
+                group.entries.push({ id: i, line: m.line, highlightedHtml: prismWrapped });
+                groupsMap.set(fileName, group);
+                flatIds.push(i);
+              })
+            );
+
             panel.webview.postMessage({
               type: 'renderResults',
-              payload: { total: 0, groups: [], flatIds: [], query: queryRaw },
+              payload: {
+                total: matches.length,
+                groups: Array.from(groupsMap.values()),
+                flatIds,
+                query: queryRaw,
+              },
             });
-            return;
-          }
+          },
 
-          const matches: { uri: vscode.Uri; line: number; preview?: string }[] = [];
+          async openAt(m) {
+            const idx = Number(m.id);
+            if (!Number.isFinite(idx)) return;
+            const rec = lastResults[idx];
+            if (!rec) return;
+            const doc = await vscode.workspace.openTextDocument(rec.uri);
+            const ed = await vscode.window.showTextDocument(doc, { preview: false });
+            const pos = new vscode.Position(rec.line, 0);
+            ed.selection = new vscode.Selection(pos, pos);
+            ed.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+          },
 
-          try {
-            const includePattern = '**/*.{ts,js,json,tsx,jsx,html,css,scss,md,txt}';
-            const excludePattern = '**/{node_modules,.git,dist,build,out}/**';
-            const uris = await vscode.workspace.findFiles(includePattern, excludePattern, 1000);
-            for (const uri of uris) {
-              try {
-                const doc = await vscode.workspace.openTextDocument(uri);
-                const text = doc.getText();
-                const lines = text.split(/\r?\n/);
-                for (let i = 0; i < lines.length; i++) {
-                  if (lines[i].toLowerCase().includes(query)) {
-                    matches.push({ uri, line: i, preview: lines[i] });
-                    if (matches.length >= 1000) break;
-                  }
-                }
-                if (matches.length >= 1000) break;
-              } catch {
-                // ignore file read errors
-              }
-            }
-          } catch (e) {
-            console.error('Error during manual search', e);
-          }
+          async esc() {
+            panel.dispose();
+          },
+        };
 
-          await enrichWithContext(matches);
-
-          lastResults = matches;
-
-          const groupsMap = new Map<
-            string,
-            { file: string; entries: { id: number; line: number; highlightedHtml: string }[] }
-          >();
-
-          const flatIds: number[] = [];
-
-          await Promise.all(
-            matches.map(async (m, i) => {
-              const wsFolder = vscode.workspace.getWorkspaceFolder(m.uri);
-              const fileName = wsFolder
-                ? m.uri.fsPath.replace(wsFolder.uri.fsPath + '/', '')
-                : m.uri.fsPath;
-
-              const group = groupsMap.get(fileName) ?? { file: fileName, entries: [] };
-              const lang = detectLangFromFile(fileName);
-
-              // 1️⃣ Highlight before escaping HTML
-              const previewRaw = m.preview ?? '';
-              const highlightedRaw = previewRaw.replace(
-                new RegExp(`(${escapeRegExp(queryRaw)})`, 'gi'),
-                '<mark>$1</mark>'
-              );
-
-              // 2️⃣ Escape HTML, but keep <mark> tags intact
-              const escapedPreview = escapeHtml(highlightedRaw)
-                .replace(/&lt;mark&gt;/g, '<mark>')
-                .replace(/&lt;\/mark&gt;/g, '</mark>');
-
-              // Wrap for Prism.js
-              const prismWrapped = `<pre class="preview"><code class="language-${lang}">${escapedPreview}</code></pre>`;
-
-              group.entries.push({ id: i, line: m.line, highlightedHtml: prismWrapped });
-              groupsMap.set(fileName, group);
-              flatIds.push(i);
-            })
-          );
-
-
-          panel.webview.postMessage({
-            type: 'renderResults',
-            payload: {
-              total: matches.length,
-              groups: Array.from(groupsMap.values()),
-              flatIds,
-              query: queryRaw,
-            },
-          });
-        } else if (msg.type === 'openAt') {
-          const idx = Number(msg.id);
-          if (!Number.isFinite(idx)) return;
-          const rec = lastResults[idx];
-          if (!rec) return;
-          const doc = await vscode.workspace.openTextDocument(rec.uri);
-          const ed = await vscode.window.showTextDocument(doc, { preview: false });
-          const pos = new vscode.Position(rec.line, 0);
-          ed.selection = new vscode.Selection(pos, pos);
-          ed.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
-        } else if (msg.type === 'esc') {
-          panel.dispose();
+        if (msg?.type && msg.type in routes) {
+          await routes[msg.type](msg);
         }
       });
     })
   );
+
+  // ----- BIND CMD+SHIFT+F ASSISTANT -----
+  const bindCmd = vscode.commands.registerCommand(COMMANDS.bindF, async () => {
+    const snippet = JSON.stringify(
+      [
+        {
+          "key": "cmd+shift+f",
+          "command": "searchEverywhere.openCustomSearch",
+          "when": "editorTextFocus || !editorIsOpen"
+        },
+        {
+          "key": "cmd+shift+f",
+          "command": "-workbench.action.findInFiles"
+        }
+      ],
+      null,
+      2
+    );
+
+    await vscode.env.clipboard.writeText(snippet);
+
+    const choice = await vscode.window.showInformationMessage(
+      "Snippet to bind ⌘⇧F to Search Everywhere copied to your clipboard. Open keybindings.json and paste it (replace existing ⌘⇧F if needed).",
+      "Open keybindings.json"
+    );
+
+    if (choice) {
+      await vscode.commands.executeCommand('workbench.action.openGlobalKeybindingsFile');
+    }
+  });
+  context.subscriptions.push(bindCmd);
+
+  // optional prompt if user enabled setting
+  const maybePromptTakeOver = async () => {
+    const takeOver = vscode.workspace.getConfiguration().get<boolean>('searchEverywhere.takeOverCmdShiftF');
+    if (!takeOver) return;
+
+    const selection = await vscode.window.showInformationMessage(
+      "Bind ⌘⇧F to Search Everywhere? (will override the default Find in Files)",
+      "Bind Now",
+      "Not Now"
+    );
+
+    const actions: Record<string, () => Thenable<void> | void> = {
+      "Bind Now": () => vscode.commands.executeCommand(COMMANDS.bindF),
+      "Not Now": () => {}
+    };
+
+    if (selection && selection in actions) await actions[selection]();
+  };
+  maybePromptTakeOver();
 }
 
 function getWebviewHtml(): string {
@@ -139,7 +202,6 @@ function getWebviewHtml(): string {
 <meta charset="UTF-8" />
 <title>Find in Files (Text Search)</title>
 
-<!-- Prism CSS -->
 <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
 
 <style>
@@ -154,13 +216,7 @@ code[class*="language-"] {
   white-space: pre-wrap !important;
   word-break: break-word !important;
 }
-
-pre[class*="language-"] {
-  background: none !important;
-  border: none !important;
-  box-shadow: none !important;
-}
-
+pre[class*="language-"] { background: none !important; border: none !important; box-shadow: none !important; }
 body { font-family: system-ui, sans-serif; margin: 0; background: #282c34; color: #abb2bf; }
 header { padding: 12px; background: #21252b; display: flex; gap: 8px; }
 input[type="text"] { flex: 1; padding: 8px; font-size: 14px; border-radius: 4px; border: none; outline:none; }
@@ -182,7 +238,6 @@ mark { background-color: #ffea00; color: black; }
 </header>
 <div id="results">Type to search…</div>
 
-<!-- Prism JS -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
@@ -199,20 +254,12 @@ let flatIndexToId = [];
 let selection = -1;
 
 document.addEventListener('DOMContentLoaded', () => {
-  setTimeout(() => {
-    input.focus();
-    input.select();
-  }, 50);
+  setTimeout(() => { input.focus(); input.select(); }, 50);
 });
 
 function escapeRegExp(str) {
-  return str.replace(/[.*+?\^\\\$\{\}()|[\]\\]/g, '\\$&');
+  return str.replace(/[.*+?^\\\\$\\{}()|[\\]\\\\]/g, '\\\\$&');
 }
-
-
-
-
-
 
 function clearSelection() {
   document.querySelectorAll('li.result.selected').forEach(el => el.classList.remove('selected'));
@@ -245,7 +292,7 @@ function renderResults(data) {
   if (!total) {
     results.textContent = 'No results';
     clearSelection();
-    setTimeout(() => { input.focus();  }, 50);
+    setTimeout(() => { input.focus(); }, 50);
     return;
   }
 
@@ -273,62 +320,55 @@ function renderResults(data) {
 
   Prism.highlightAll();
 
- if (data.query) {
-  var escapedQuery = escapeRegExp(data.query);
-  var regex = new RegExp(escapedQuery, 'gi');
+  if (data.query) {
+    var escapedQuery = escapeRegExp(data.query);
+    var regex = new RegExp(escapedQuery, 'gi');
 
-  document.querySelectorAll('code').forEach(function(codeEl) {
-    // Step 1: Flatten Prism HTML into plain text + segment mapping
-    var segments = [];
-    var plainText = '';
-
-    (function walk(node) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        segments.push({ start: plainText.length, end: plainText.length + node.nodeValue.length, node: node });
-        plainText += node.nodeValue;
-      } else if (node.nodeType === Node.ELEMENT_NODE) {
-        node.childNodes.forEach(walk);
-      }
-    })(codeEl);
-
-    // Step 2: Find all matches in plain text
-    var matches = [];
-    var m;
-    while ((m = regex.exec(plainText)) !== null) {
-      matches.push({ start: m.index, end: m.index + m[0].length });
-    }
-    if (!matches.length) return;
-
-    // Step 3: Wrap matches in <mark> without breaking Prism tags
-    matches.reverse().forEach(function(match) {
-      segments.forEach(function(seg) {
-        if (seg.end <= match.start || seg.start >= match.end) return; // no overlap
-        var nodeMatchStart = Math.max(seg.start, match.start) - seg.start;
-        var nodeMatchEnd = Math.min(seg.end, match.end) - seg.start;
-
-        if (nodeMatchStart < nodeMatchEnd) {
-          var text = seg.node.nodeValue;
-          var before = text.slice(0, nodeMatchStart);
-          var mid = text.slice(nodeMatchStart, nodeMatchEnd);
-          var after = text.slice(nodeMatchEnd);
-
-          var mark = document.createElement('mark');
-          mark.textContent = mid;
-
-          var frag = document.createDocumentFragment();
-          if (before) frag.appendChild(document.createTextNode(before));
-          frag.appendChild(mark);
-          if (after) frag.appendChild(document.createTextNode(after));
-
-          seg.node.parentNode.replaceChild(frag, seg.node);
-          seg.node = mark.nextSibling || mark; // update mapping
+    document.querySelectorAll('code').forEach(function(codeEl) {
+      var segments = [];
+      var plainText = '';
+      (function walk(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          segments.push({ start: plainText.length, end: plainText.length + node.nodeValue.length, node: node });
+          plainText += node.nodeValue;
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+          node.childNodes.forEach(walk);
         }
+      })(codeEl);
+
+      var matches = [];
+      var m;
+      while ((m = regex.exec(plainText)) !== null) {
+        matches.push({ start: m.index, end: m.index + m[0].length });
+      }
+      if (!matches.length) return;
+
+      matches.reverse().forEach(function(match) {
+        segments.forEach(function(seg) {
+          if (seg.end <= match.start || seg.start >= match.end) return;
+          var nodeMatchStart = Math.max(seg.start, match.start) - seg.start;
+          var nodeMatchEnd = Math.min(seg.end, match.end) - seg.start;
+          if (nodeMatchStart < nodeMatchEnd) {
+            var text = seg.node.nodeValue;
+            var before = text.slice(0, nodeMatchStart);
+            var mid = text.slice(nodeMatchStart, nodeMatchEnd);
+            var after = text.slice(nodeMatchEnd);
+
+            var mark = document.createElement('mark');
+            mark.textContent = mid;
+
+            var frag = document.createDocumentFragment();
+            if (before) frag.appendChild(document.createTextNode(before));
+            frag.appendChild(mark);
+            if (after) frag.appendChild(document.createTextNode(after));
+
+            seg.node.parentNode.replaceChild(frag, seg.node);
+            seg.node = mark.nextSibling || mark;
+          }
+        });
       });
     });
-  });
-}
-
-
+  }
 
   const first = document.querySelector('li.result');
   if (first) applySelection(0);
@@ -346,7 +386,7 @@ function debounce(fn, ms) {
 
 const doSearch = () => {
   const query = input.value.trim();
-  if (query.length === 0) {
+  if (!query) {
     results.textContent = 'Type to search…';
     clearSelection();
     return;
@@ -355,39 +395,30 @@ const doSearch = () => {
   vscode.postMessage({ type: 'doSearch', query });
 };
 
-input.addEventListener('input', debounce(doSearch, 300));
+const cfgDebounce = 300; // UI-side fallback; real search debounce is handled by extension setting if needed
+input.addEventListener('input', debounce(doSearch, cfgDebounce));
 btn.addEventListener('click', doSearch);
 
 input.addEventListener('keydown', e => {
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    if (selection >= 0) openSelected();
-    else doSearch();
-  }
-  if (e.key === 'ArrowDown') {
-    e.preventDefault();
-    const all = document.querySelectorAll('li.result');
-    if (all.length === 0) return;
-    if (selection < 0) applySelection(0);
-    else applySelection(selection + 1);
-  }
-  if (e.key === 'ArrowUp') {
-    e.preventDefault();
-    const all = document.querySelectorAll('li.result');
-    if (all.length === 0) return;
-    if (selection < 0) applySelection(0);
-    else applySelection(selection - 1);
-  }
-  if (e.key === 'Escape') {
-    e.preventDefault();
-    vscode.postMessage({ type: 'esc' });
-  }
+  if (e.key === 'Enter') { e.preventDefault(); if (selection >= 0) openSelected(); else doSearch(); }
+  if (e.key === 'ArrowDown') { e.preventDefault(); const all = document.querySelectorAll('li.result'); if (!all.length) return; if (selection < 0) applySelection(0); else applySelection(selection + 1); }
+  if (e.key === 'ArrowUp') { e.preventDefault(); const all = document.querySelectorAll('li.result'); if (!all.length) return; if (selection < 0) applySelection(0); else applySelection(selection - 1); }
+  if (e.key === 'Escape') { e.preventDefault(); vscode.postMessage({ type: 'esc' }); }
 });
 
+// init + focus
 window.addEventListener('message', event => {
-  if (event.data.type === 'renderResults') {
-    renderResults(event.data.payload);
-  }
+  const handlers = {
+    renderResults: () => renderResults(event.data.payload),
+    init: () => {
+      const q = (event.data.initialQuery || '').toString();
+      if (q) { input.value = q; doSearch(); }
+      setTimeout(() => { input.focus(); if (q) input.select(); }, 30);
+    },
+    focusSearch: () => { input.focus(); input.select(); }
+  };
+  const type = event?.data?.type;
+  if (type && type in handlers) handlers[type]();
 });
 </script>
 </body>
@@ -438,5 +469,15 @@ function detectLangFromFile(path: string): 'ts' | 'js' | 'json' {
   if (path.endsWith('.json')) return 'json';
   return 'ts';
 }
+
+// strategy table for initial query (selection > word > clipboard)
+async function pickInitialQuery(editor?: vscode.TextEditor): Promise<string> {
+  const getSelection = () =>
+    editor?.selections?.[0]?.isEmpty ? '' : (editor?.document.getText(editor.selection) ?? '');
+
+  const v = (await getSelection()).trim();
+  return v ? v.slice(0, 512) : '';
+}
+
 
 export function deactivate() { }
