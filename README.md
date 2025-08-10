@@ -40,14 +40,14 @@ Now you can enjoy lightning-fast, keyboard-driven search without leaving your fl
 
 ## Screenshots
 
-![Search Panel](./media/singleResult.png)  
+![Search Panel](media/singleResult.png)  
 *Single result*
 
-![Results Highlight](./media/multipleResults.png)  
+![Results Highlight](media/multipleResults.png)  
 *Multiple results*
 *Syntax-highlighted matches with `<mark>` highlighting and context*
 
-![Flags Panel](./media/flags.png)  
+![Flags Panel](media/flags.png)  
 *flags use for search*
 
 ---
