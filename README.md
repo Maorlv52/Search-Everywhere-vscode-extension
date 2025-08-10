@@ -40,15 +40,16 @@ Now you can enjoy lightning-fast, keyboard-driven search without leaving your fl
 
 ## Screenshots
 
-![Search Panel](media/singleResult.png)  
+![Search Panel](https://raw.githubusercontent.com/Maorlv52/Search-Everywhere-vscode-extension/dev/media/singleResult.png)  
 *Single result*
 
-![Results Highlight](media/multipleResults.png)  
-*Multiple results*
+![Results Highlight](https://raw.githubusercontent.com/Maorlv52/Search-Everywhere-vscode-extension/dev/media/multipleResults.png)  
+*Multiple results*  
 *Syntax-highlighted matches with `<mark>` highlighting and context*
 
-![Flags Panel](media/flags.png)  
-*flags use for search*
+![Flags Panel](https://raw.githubusercontent.com/Maorlv52/Search-Everywhere-vscode-extension/dev/media/flags.png)  
+*Flags used for search*
+
 
 ---
 
