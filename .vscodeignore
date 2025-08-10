@@ -1,11 +1,12 @@
-# Ignore test files and build output
+# Ignore dev and build artifacts
+node_modules
 out/test/**
-node_modules/**
-.vscode/**
-.git/**
+.vscode
+.git
 .gitignore
 tsconfig.json
 pnpm-lock.yaml
 
-# ⚠️ DO NOT ignore media/
-# DO NOT include media/** here
+# Keep README and media (screenshots) in the .vsix
+!README.md
+!media/**
