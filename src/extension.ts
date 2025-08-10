@@ -9,6 +9,35 @@ const COMMANDS = {
   bindF: 'searchEverywhere.bindCmdShiftF',
 } as const;
 
+type Scope = 'workspace' | 'open' | 'current';
+
+/* tiny, isolated scope helper */
+async function getUrisByScope(scope: Scope): Promise<vscode.Uri[]> {
+  const strategies: Record<Scope, () => Promise<vscode.Uri[]>> = {
+    async workspace() {
+      const includePattern = '**/*.{ts,js,json,tsx,jsx,html,css,scss,md,txt}';
+      const excludePattern = '**/{node_modules,.git,dist,build,out}/**';
+      return vscode.workspace.findFiles(includePattern, excludePattern, 20000);
+    },
+    async open() {
+      const fromEditors = vscode.window.visibleTextEditors
+        .map(e => e.document?.uri)
+        .filter(Boolean) as vscode.Uri[];
+      const fromDocs = vscode.workspace.textDocuments
+        .filter(d => d.uri.scheme === 'file')
+        .map(d => d.uri);
+      const set = new Map<string, vscode.Uri>();
+      [...fromEditors, ...fromDocs].forEach(u => set.set(u.fsPath, u));
+      return [...set.values()];
+    },
+    async current() {
+      const u = vscode.window.activeTextEditor?.document?.uri;
+      return u ? [u] : [];
+    }
+  };
+  return strategies[scope]();
+}
+
 export function activate(context: vscode.ExtensionContext) {
   // ----- OPEN CUSTOM SEARCH -----
   context.subscriptions.push(
@@ -37,6 +66,7 @@ export function activate(context: vscode.ExtensionContext) {
             const queryRaw = (m.query ?? '').toString();
             const q = queryRaw.trim();
             const flags = (m.flags ?? {}) as { case?: boolean; regex?: boolean; word?: boolean };
+            const scope = ((m.scope as Scope) || 'workspace') as Scope;
 
             if (!q) {
               panel.webview.postMessage({
@@ -64,9 +94,7 @@ export function activate(context: vscode.ExtensionContext) {
 
             const matches: { uri: vscode.Uri; line: number; preview?: string }[] = [];
             try {
-              const includePattern = '**/*.{ts,js,json,tsx,jsx,html,css,scss,md,txt}';
-              const excludePattern = '**/{node_modules,.git,dist,build,out}/**';
-              const uris = await vscode.workspace.findFiles(includePattern, excludePattern, 1000);
+              const uris = await getUrisByScope(scope);
 
               for (const uri of uris) {
                 try {
@@ -211,12 +239,37 @@ input[type="text"]{flex:1; font-size:14px; color:var(--text); background:transpa
 .kbdHint{color:var(--muted); font-size:11.5px; margin-left:6px}
 .btn{padding:6px 10px; border:1px solid var(--border); background:var(--accent); color:#fff; border-radius:10px; font-weight:600; cursor:pointer}
 .btn:active{transform:translateY(1px)}
-.chips{display:flex; gap:6px}
-.chip{display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border-radius:999px; background:#2a3140; border:1px solid var(--border); cursor:pointer; user-select:none; font-size:12px}
-.chip[data-active="true"]{background:var(--accent-2); color:#101318; border-color:transparent}
-.chip .dot{width:7px; height:7px; border-radius:999px; background:currentColor; opacity:.5}
+
+/* keep original chips in DOM but hide (safety) */
+.chips{display:none}
+
+/* tiny dropdowns */
+.select{position:relative}
+.select > select{
+  appearance:none; background:#2a3140; border:1px solid var(--border); color:var(--text);
+  border-radius:10px; padding:6px 28px 6px 10px; font-size:12px; cursor:pointer
+}
+.select:after{
+  content:'▾'; position:absolute; right:8px; top:50%; transform:translateY(-50%); font-size:11px; color:var(--muted);
+}
+/* Flags menu */
+details.menu{position:relative}
+summary.menuBtn{
+  list-style:none; padding:6px 10px; border:1px solid var(--border); background:#2a3140; color:var(--text);
+  border-radius:10px; font-size:12px; cursor:pointer; user-select:none
+}
+summary.menuBtn::-webkit-details-marker{display:none}
+details[open] .menuBtn{filter:brightness(1.05)}
+.menuList{
+  position:absolute; top:calc(100% + 6px); right:0; min-width:160px;
+  background:#212735; border:1px solid var(--border); border-radius:10px; padding:6px; box-shadow:0 6px 24px rgba(0,0,0,.35)
+}
+.menuItem{display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:8px; cursor:pointer; font-size:12px}
+.menuItem:hover{background:rgba(255,255,255,0.04)}
+.menuItem input{margin:0}
+
 .meta{margin-left:auto; display:flex; align-items:center; gap:10px; color:var(--muted)}
-.meta .badge{background:#222836; border:1px solid var(--border); border-radius:999px; padding:2px 8px; color:var(--text); font-size:12px}
+.meta .badge{background:#222836; border:1px solid var(--border); border-radius:999px; padding:2px 8px; color:#fff; font-size:12px}
 .results{padding:10px 12px 24px}
 .group{border:1px solid var(--border); border-radius:10px; background:#212735; margin:8px 0 12px; overflow:hidden}
 .groupHeader{display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer; user-select:none; background:var(--bg-elev-2)}
@@ -245,7 +298,29 @@ pre[class*="language-"], code[class*="language-"]{background:none !important; ma
         <input id="searchInput" type="text" placeholder="Search text (case-insensitive)" autofocus />
         <span class="kbdHint small">↵ open · ↑/↓ navigate · esc close</span>
       </div>
+
+      <!-- Flags dropdown (new) -->
+      <details class="menu" id="flagsMenu">
+        <summary class="menuBtn">Flags ▾</summary>
+        <div class="menuList" role="menu">
+          <label class="menuItem"><input type="checkbox" id="flagCase" /> Case</label>
+          <label class="menuItem"><input type="checkbox" id="flagRegex" /> Regex</label>
+          <label class="menuItem"><input type="checkbox" id="flagWord" /> Word</label>
+        </div>
+      </details>
+
+      <!-- Scope select (new) -->
+      <div class="select">
+        <select id="scopeSelect" title="Search in">
+          <option value="workspace" selected>Workspace</option>
+          <option value="open">Open files</option>
+          <option value="current">Current file</option>
+        </select>
+      </div>
+
+      <!-- keep chips node (hidden) so old logic never breaks -->
       <div class="chips" id="chips" title="Case / Regex / Word"></div>
+
       <button class="btn" id="searchBtn">Search</button>
       <div class="meta">
         <span class="badge" id="counter">0 results</span>
@@ -272,20 +347,24 @@ const el = {
   chips: document.getElementById('chips'),
   results: document.getElementById('results'),
   counter: document.getElementById('counter'),
-  elapsed: document.getElementById('elapsed')
+  elapsed: document.getElementById('elapsed'),
+  flagsMenu: document.getElementById('flagsMenu'),
+  flagCase: document.getElementById('flagCase'),
+  flagRegex: document.getElementById('flagRegex'),
+  flagWord: document.getElementById('flagWord'),
+  scopeSelect: document.getElementById('scopeSelect'),
 };
 
 let flatIndexToId = [];
 let selection = -1;
 let currentFlags = { case: false, regex: false, word: false };
 
-// chips (default OFF each open)
+/* ---- original chips logic kept (hidden), so no runtime break ---- */
 const toggles = [
   { key: 'case',  label: 'Case',  active: false },
   { key: 'regex', label: 'Regex', active: false },
   { key: 'word',  label: 'Word',  active: false },
 ];
-
 const chipTpl = ({key,label,active}) => {
   const c = document.createElement('div');
   c.className = 'chip'; c.dataset.key = key; c.dataset.active = String(active);
@@ -294,12 +373,33 @@ const chipTpl = ({key,label,active}) => {
   return c;
 };
 const renderChips = () => { el.chips.innerHTML = ''; toggles.map(chipTpl).forEach(c => el.chips.appendChild(c)); };
-const getFlags = () => Object.fromEntries(Array.from(el.chips.children).map(c => [c.dataset.key, c.dataset.active === 'true']));
 
-document.addEventListener('DOMContentLoaded', () => { setTimeout(() => { el.input.focus(); el.input.select(); }, 40); renderChips(); });
+/* unified getter: prefer dropdown flags, fallback to chips */
+const getFlags = () => {
+  if (el.flagCase && el.flagRegex && el.flagWord) {
+    return {
+      case: !!el.flagCase.checked,
+      regex: !!el.flagRegex.checked,
+      word: !!el.flagWord.checked
+    };
+  }
+  return Object.fromEntries(Array.from(el.chips.children).map(c => [c.dataset.key, c.dataset.active === 'true']));
+};
+
+const getScope = () => (el.scopeSelect && el.scopeSelect.value) ? el.scopeSelect.value : 'workspace';
+
+document.addEventListener('DOMContentLoaded', () => {
+  setTimeout(() => { el.input.focus(); el.input.select(); }, 40);
+  renderChips(); // safe: chips exist but hidden
+  // defaults each open for dropdown
+  if (el.flagCase) { el.flagCase.checked = false; }
+  if (el.flagRegex) { el.flagRegex.checked = false; }
+  if (el.flagWord) { el.flagWord.checked = false; }
+  if (el.scopeSelect) { el.scopeSelect.value = 'workspace'; }
+});
 
 // utils
-function escapeRegExp(str){return str.replace(/[.*+?^\\\\$\\{}()|[\\]\\\\]/g,'\\\\$&');}
+function escapeRegExp(str){return str.replace(/[.*+?^\\$\\{}()|[\\]\\\\]/g,'\\\\$&');}
 function clearSelection(){ document.querySelectorAll('li.result.selected').forEach(n=>n.classList.remove('selected')); selection=-1; }
 function applySelection(index){ const all=[...document.querySelectorAll('li.result')]; if(!all.length) return; selection=Math.max(0,Math.min(index,all.length-1)); all.forEach(n=>n.classList.remove('selected')); const sel=all[selection]; if(sel){ sel.classList.add('selected'); sel.scrollIntoView({block:'center', inline:'nearest', behavior:'smooth'}); } }
 function openSelected(){ if(selection<0) return; const id=flatIndexToId[selection]; if(typeof id!=='number') return; vscode.postMessage({type:'openAt', id}); vscode.postMessage({type:'esc'}); }
@@ -411,7 +511,9 @@ const doSearch = () => {
   if (!q){ el.results.innerHTML='<div class="state">Type to search…</div>'; el.counter.textContent='0 results'; el.elapsed.textContent=''; clearSelection(); return; }
   el.results.innerHTML='<div class="state">Searching…</div>';
   currentFlags = getFlags(); // persist flags for marking step
-  vscode.postMessage({ type:'doSearch', query:q, flags: currentFlags });
+  vscode.postMessage({ type:'doSearch', query:q, flags: currentFlags, scope: getScope() });
+  const fm = document.getElementById('flagsMenu');
+  if (fm && 'open' in fm) { fm.open = false; } // close flags after search (if opened)
 };
 
 el.input.addEventListener('input', debounce(doSearch, 300));
@@ -427,12 +529,17 @@ el.input.addEventListener('keydown', e => {
   const fn = handlers[e.key]; if(fn){ e.preventDefault(); fn(); }
 });
 
-// messages (reset chips each open)
+// messages (reset chips & dropdowns each open)
 window.addEventListener('message', event => {
   const table = {
     renderResults: () => renderResults(event.data.payload),
     init: () => {
-      renderChips(); // reset OFF
+      renderChips(); // reset OFF (chips hidden)
+      if (el.flagCase) el.flagCase.checked = false;
+      if (el.flagRegex) el.flagRegex.checked = false;
+      if (el.flagWord) el.flagWord.checked = false;
+      if (el.scopeSelect) el.scopeSelect.value = 'workspace';
+
       const q = (event.data.initialQuery || '').toString();
       if (q){ el.input.value = q; doSearch(); }
       setTimeout(() => { el.input.focus(); q && el.input.select(); }, 20);
@@ -494,7 +601,8 @@ function detectLangFromFile(path: string): 'ts' | 'js' | 'json' {
 
 // selection only
 async function pickInitialQuery(editor?: vscode.TextEditor): Promise<string> {
-  const getSelection = () => editor?.selections?.[0]?.isEmpty ? '' : (editor?.document.getText(editor.selection) ?? '');
+  const getSelection = () =>
+    editor?.selections?.[0]?.isEmpty ? '' : (editor?.document.getText(editor.selection) ?? '');
   const v = (await getSelection()).trim();
   return v ? v.slice(0, 512) : '';
 }

@@ -2,7 +2,7 @@
   "name": "search-everywhere-lite",
   "displayName": "Search Everywhere Lite",
   "publisher": "Maorlevinshtein",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Text-only search with fast results, MRU, and custom WebView with context and highlighting.",
   "icon": "icon.png",
   "repository": {
