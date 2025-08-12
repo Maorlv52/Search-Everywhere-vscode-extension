@@ -188,8 +188,6 @@ export function activate(context: vscode.ExtensionContext) {
       null, 2
     );
 
-    
-
     await vscode.env.clipboard.writeText(snippet);
 
     const choice = await vscode.window.showInformationMessage(
