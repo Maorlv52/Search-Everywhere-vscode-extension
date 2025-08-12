@@ -190,7 +190,7 @@ export function activate(context: vscode.ExtensionContext) {
     
     await vscode.env.clipboard.writeText(snippet);
 
-    
+
     const choice = await vscode.window.showInformationMessage(
       "Snippet to bind ⌘⇧F to Search Everywhere copied to your clipboard. Open keybindings.json and paste it.",
       "Open keybindings.json"
