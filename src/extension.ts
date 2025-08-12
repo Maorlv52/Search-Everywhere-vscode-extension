@@ -190,7 +190,6 @@ export function activate(context: vscode.ExtensionContext) {
     
     await vscode.env.clipboard.writeText(snippet);
 
-
     const choice = await vscode.window.showInformationMessage(
       "Snippet to bind ⌘⇧F to Search Everywhere copied to your clipboard. Open keybindings.json and paste it.",
       "Open keybindings.json"
@@ -198,7 +197,6 @@ export function activate(context: vscode.ExtensionContext) {
     if (choice) await vscode.commands.executeCommand('workbench.action.openGlobalKeybindingsFile');
   });
   context.subscriptions.push(bindCmd);
-
 
   // Optional prompt (respects setting)
   const maybePromptTakeOver = async () => {
