@@ -39,6 +39,10 @@ async function getUrisByScope(scope: Scope): Promise<vscode.Uri[]> {
 }
 
 
+
+
+
+
 export function activate(context: vscode.ExtensionContext) {
   // ----- OPEN CUSTOM SEARCH -----
   context.subscriptions.push(
