@@ -200,6 +200,8 @@ export function activate(context: vscode.ExtensionContext) {
   });
   context.subscriptions.push(bindCmd);
 
+
+  
   // Optional prompt (respects setting)
   const maybePromptTakeOver = async () => {
     const takeOver = vscode.workspace.getConfiguration().get<boolean>('searchEverywhere.takeOverCmdShiftF');
