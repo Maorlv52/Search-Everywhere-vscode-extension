@@ -200,7 +200,6 @@ export function activate(context: vscode.ExtensionContext) {
   });
   context.subscriptions.push(bindCmd);
 
-
   
   // Optional prompt (respects setting)
   const maybePromptTakeOver = async () => {
