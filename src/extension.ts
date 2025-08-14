@@ -16,6 +16,9 @@ type Scope = 'workspace' | 'open' | 'current' | 'node_modules';
 let currentSearchCts: vscode.CancellationTokenSource | undefined;
 let searchSeq = 0; // 🆕 monotonically increasing id per search
 let searchPanel: vscode.WebviewPanel | undefined;
+let lastQuery = '';
+let lastFlags: { case?: boolean; regex?: boolean; word?: boolean } = {};
+let lastScope: Scope = 'workspace';
 const MAX_RESULTS = 500;
 const MAX_FILE_BYTES = 2_000_000;        // skip giant files (> ~2MB)
 const decoder = new TextDecoder('utf-8'); // reuse across files
@@ -317,7 +320,11 @@ export function activate(context: vscode.ExtensionContext) {
             const queryRaw = (m.query ?? '').toString();
             const q = queryRaw.trim();
             const flags = (m.flags ?? {}) as { case?: boolean; regex?: boolean; word?: boolean };
-            const scope = ((m.scope as Scope) || 'workspace') as Scope;
+            const scope = ((m.scope as Scope) || lastScope || 'workspace') as Scope;
+
+            lastQuery = q;
+            lastFlags = flags;
+            lastScope = scope;
 
             if (!q) {
               const seq = ++searchSeq; // still advance so UI ignores older payloads
@@ -532,6 +539,38 @@ export function activate(context: vscode.ExtensionContext) {
             ed.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
           },
 
+          async scopeChanged(m) {
+            const nextScope = (m.scope as Scope) || 'workspace';
+            lastScope = nextScope; // מעדכן לזכור את ההחלפה
+            if (!lastQuery.trim()) {
+              panel.webview.postMessage({ type: 'scopeSet', scope: lastScope });
+              setTimeout(() => panel.webview.postMessage({ type: 'focusSearch' }), 10);
+              return;
+            }
+            try { currentSearchCts?.cancel(); } catch { }
+            await routes.doSearch({ query: lastQuery, flags: lastFlags, scope: lastScope });
+          },
+
+          async flagsChanged(m) {
+            const next = (m.flags ?? {}) as { case?: boolean; regex?: boolean; word?: boolean };
+
+            lastFlags = {
+              case: !!next.case,
+              regex: !!next.regex,
+              word: !!next.word,
+            };
+
+            if (!lastQuery.trim()) {
+              panel.webview.postMessage({ type: 'flagsSet', flags: lastFlags });
+              return;
+            }
+
+            try { currentSearchCts?.cancel(); } catch { }
+            await routes.doSearch({ query: lastQuery, flags: lastFlags, scope: lastScope });
+          },
+
+
+
           async esc() {
             panel.dispose();
           }
@@ -611,6 +650,9 @@ body{margin:0; background:var(--bg); color:var(--text); font:13px/1.5 ui-sans-se
   background:linear-gradient(180deg,var(--bg-elev) 0%,rgba(0,0,0,0) 100%);
   border-bottom:1px solid var(--border);
   backdrop-filter:saturate(1.2) blur(6px);
+  will-change: transform;
+  transform: translateZ(0);
+  overflow: visible;
 }
 .toolbarInner{display:flex; align-items:center; gap:10px; padding:10px 0; flex-wrap: wrap;}
 
@@ -652,7 +694,10 @@ summary.menuBtn::-webkit-details-marker{display:none}
 details[open] .menuBtn{filter:brightness(1.05)}
 .menuList{
   position:absolute; top:calc(100% + 6px); right:0; min-width:160px;
-  background:#212735; border:1px solid var(--border); border-radius:10px; padding:6px; box-shadow:0 6px 24px rgba(0,0,0,.35)
+  background:#212735; border:1px solid var(--border); border-radius:10px; padding:6px; box-shadow:0 6px 24px rgba(0,0,0,.35);
+  will-change: transform;
+  transform: translateZ(0);
+  z-index: 1000;
 }
 .menuItem{display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:8px; cursor:pointer; font-size:12px}
 .menuItem:hover{background:rgba(255,255,255,0.04)}
@@ -816,6 +861,9 @@ const getFlags = () => {
 
 const getScope = () => (el.scopeSelect && el.scopeSelect.value) ? el.scopeSelect.value : 'workspace';
 
+const isFlagsOpen = () =>
+  !!(el.flagsMenu && 'open' in el.flagsMenu && el.flagsMenu.open);
+
 document.addEventListener('DOMContentLoaded', () => {
   setTimeout(() => { el.input.focus(); el.input.select(); }, 40);
   renderChips(); // safe: chips exist but hidden
@@ -825,6 +873,34 @@ document.addEventListener('DOMContentLoaded', () => {
   if (el.flagWord) { el.flagWord.checked = false; }
   if (el.scopeSelect) { el.scopeSelect.value = 'workspace'; }
 });
+
+// rerun immediately when scope changes (no need to touch the input)
+el.scopeSelect?.addEventListener('change', () => {
+  const scope = getScope();
+  showSearching();                       // optimistic UI
+  vscode.postMessage({ type: 'scopeChanged', scope });
+
+  const fm = el.flagsMenu;
+  if (fm && 'open' in fm) fm.open = false;  // optional: close flags dropdown
+});
+
+[el.flagCase, el.flagRegex, el.flagWord].forEach(cb => {
+  cb?.addEventListener('change', onFlagChange);
+});
+
+function showSearching(){
+  el.results.innerHTML = '<div class="state">Searching…</div>';
+  el.counter.textContent = '…';
+  el.elapsed.textContent = '';
+}
+
+function onFlagChange() {
+  currentFlags = getFlags();   
+  vscode.postMessage({         
+    type: 'flagsChanged',
+    flags: currentFlags
+  });
+}
 
 // utils
 function escapeRegExp(str){return str.replace(/[.*+?^\\$\\{}()|[\\]\\\\]/g,'\\\\$&');}
@@ -938,13 +1014,20 @@ function renderResults(data){
 
   const frag = document.createDocumentFragment();
   groups.forEach(function(g){ frag.appendChild(makeGroup(g)); });
-  el.results.appendChild(frag);
+  el.results.replaceChildren(frag);
 
   Prism.highlightAll();
 markAfterPrism(query);
 
+// avoid scroll/focus jank while Flags menu is open
 const first = document.querySelector('li.result');
-if (first) { applySelection(0); } else { clearSelection(); }
+const fmOpen = isFlagsOpen();
+
+if (first && !fmOpen) {
+  applySelection(0);            // scroll only when flags menu is closed
+} else if (!first) {
+  clearSelection();
+}
 
 // --- robust header computation (payload OR DOM fallback) ---
 const isNum = v => typeof v === 'number' && isFinite(v);
@@ -970,10 +1053,9 @@ el.counter.textContent =
 
 el.elapsed.textContent = elapsedText;
 
-setTimeout(() => { el.input.focus(); }, 20);
+// don't steal focus from the checkbox while flags are open
+setTimeout(() => { if (!fmOpen) { el.input.focus(); } }, 20);
 }
-
-
 
 // debounce + search
 let debounceTimer; const debounce = (fn,ms)=>(...a)=>{ clearTimeout(debounceTimer); debounceTimer=setTimeout(()=>fn(...a),ms); };
@@ -995,9 +1077,6 @@ const doSearch = () => {
 
   currentFlags = getFlags(); // persist flags for marking step
   vscode.postMessage({ type:'doSearch', query:q, flags: currentFlags, scope: getScope() });
-
-  const fm = document.getElementById('flagsMenu');
-  if (fm && 'open' in fm) { fm.open = false; }
 };
 
 
@@ -1029,7 +1108,24 @@ window.addEventListener('message', event => {
       if (q){ el.input.value = q; doSearch(); }
       setTimeout(() => { el.input.focus(); q && el.input.select(); }, 20);
     },
-    focusSearch: () => { el.input.focus(); el.input.select(); }
+    focusSearch: () => { el.input.focus(); el.input.select(); },
+        scopeSet: () => {
+      if (el.scopeSelect) el.scopeSelect.value = (event.data.scope || 'workspace');
+    },
+     flagsSet: () => {
+      const f = event.data.flags || {};
+      if (el.flagCase)  el.flagCase.checked  = !!f.case;
+      if (el.flagRegex) el.flagRegex.checked = !!f.regex;
+      if (el.flagWord)  el.flagWord.checked  = !!f.word;
+      currentFlags = getFlags();
+    },
+    progress: () => {
+      const { matches, files, elapsed } = event.data.payload || {};
+      el.counter.textContent =
+      (Number(matches) || 0) + ' results · ' + (Number(files) || 0) + ' files';
+      if (typeof elapsed === 'number') el.elapsed.textContent = elapsed + ' ms';
+},
+
   };
   const { type } = event.data || {};
   type && table[type]?.();
