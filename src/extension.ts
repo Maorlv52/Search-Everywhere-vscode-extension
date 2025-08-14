@@ -11,6 +11,12 @@ const COMMANDS = {
 
 type Scope = 'workspace' | 'open' | 'current';
 
+// ---- fast search globals ----
+let currentSearchCts: vscode.CancellationTokenSource | undefined;
+const MAX_RESULTS = 500;                 // keep UI snappy
+const MAX_FILE_BYTES = 2_000_000;        // skip giant files (> ~2MB)
+const decoder = new TextDecoder('utf-8'); // reuse across files
+
 /* tiny, isolated scope helper */
 async function getUrisByScope(scope: Scope): Promise<vscode.Uri[]> {
   const strategies: Record<Scope, () => Promise<vscode.Uri[]>> = {
@@ -36,6 +42,62 @@ async function getUrisByScope(scope: Scope): Promise<vscode.Uri[]> {
     }
   };
   return strategies[scope]();
+}
+
+/* -------- fast FS scanner (no findTextInFiles) -------- */
+type Match = { uri: vscode.Uri; line: number; preview?: string };
+
+function buildSource(q: string, flags: { case?: boolean; regex?: boolean; word?: boolean }) {
+  const src = flags.regex ? q : escapeRegExp(q);
+  return flags.word ? `\\b${src}\\b` : src;
+}
+
+function makeLineTester(source: string, flags: { case?: boolean }) {
+  const baseFlags = flags.case ? '' : 'i';
+  try {
+    return new RegExp(source, baseFlags); // per-line test – no 'g'
+  } catch {
+    return null;
+  }
+}
+
+async function scanFilesFs(
+  uris: vscode.Uri[],
+  q: string,
+  flags: { case?: boolean; regex?: boolean; word?: boolean },
+  limit = MAX_RESULTS,
+  token?: vscode.CancellationToken
+): Promise<Match[]> {
+  const matches: Match[] = [];
+  const source = buildSource(q, flags);
+  const reTest = makeLineTester(source, flags);
+  if (!reTest) return matches; // invalid regex handled upstream
+
+  outer: for (const uri of uris) {
+    if (token?.isCancellationRequested) break;
+
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      // skip huge files
+      if (typeof (stat as any).size === 'number' && (stat as any).size > MAX_FILE_BYTES) continue;
+
+      const raw = await vscode.workspace.fs.readFile(uri);
+      const text = decoder.decode(raw);
+      const lines = text.split(/\r?\n/);
+
+      for (let i = 0; i < lines.length; i++) {
+        if (token?.isCancellationRequested) break outer;
+        if (reTest.test(lines[i])) {
+          matches.push({ uri, line: i });
+          if (matches.length >= limit) break outer;
+        }
+      }
+    } catch {
+      // ignore unreadable files
+    }
+  }
+
+  return matches;
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -76,10 +138,9 @@ export function activate(context: vscode.ExtensionContext) {
               return;
             }
 
-            // Build regex safely
+            // Build regex safely for non-workspace paths (open/current) and validation
             let source = flags.regex ? q : escapeRegExp(q);
             if (flags.word) source = `\\b${source}\\b`;
-
             const baseFlags = flags.case ? '' : 'i';
             let reTest: RegExp;
             try {
@@ -92,27 +153,39 @@ export function activate(context: vscode.ExtensionContext) {
               return;
             }
 
-            const matches: { uri: vscode.Uri; line: number; preview?: string }[] = [];
-            try {
-              const uris = await getUrisByScope(scope);
+            // cancel previous search (if any)
+            currentSearchCts?.cancel();
+            currentSearchCts = new vscode.CancellationTokenSource();
+            const { token } = currentSearchCts;
 
-              for (const uri of uris) {
-                try {
-                  const doc = await vscode.workspace.openTextDocument(uri);
-                  const lines = doc.getText().split(/\r?\n/);
-                  for (let i = 0; i < lines.length; i++) {
-                    if (reTest.test(lines[i])) {
-                      matches.push({ uri, line: i, preview: lines[i] });
-                      if (matches.length >= 1000) break;
+            let matches: { uri: vscode.Uri; line: number; preview?: string }[] = [];
+            try {
+              if (scope === 'workspace') {
+                const uris = await getUrisByScope('workspace');
+                matches = await scanFilesFs(uris, q, flags, MAX_RESULTS, token);
+              } else {
+                // fast enough for open/current via openTextDocument
+                const uris = await getUrisByScope(scope);
+
+                outer: for (const uri of uris) {
+                  if (token.isCancellationRequested) break;
+                  try {
+                    const doc = await vscode.workspace.openTextDocument(uri);
+                    const lines = doc.getText().split(/\r?\n/);
+                    for (let i = 0; i < lines.length; i++) {
+                      if (token.isCancellationRequested) break outer;
+                      if (reTest.test(lines[i])) {
+                        matches.push({ uri, line: i });
+                        if (matches.length >= MAX_RESULTS) break outer;
+                      }
                     }
-                  }
-                  if (matches.length >= 1000) break;
-                } catch {
-                  // ignore file errors
+                  } catch { /* ignore file errors */ }
                 }
               }
             } catch (e) {
-              console.error('Error during manual search', e);
+              console.error('search error', e);
+            } finally {
+              currentSearchCts = undefined;
             }
 
             await enrichWithContext(matches);
@@ -135,7 +208,7 @@ export function activate(context: vscode.ExtensionContext) {
                 const lang = detectLangFromFile(fileName);
 
                 // No <mark> here; Prism first, then client-side marking
-                const previewRaw = m.preview ?? '';
+                const previewRaw = (m.preview ?? '').replace(/\r\n?/g, '\n');
                 const escapedPreview = escapeHtml(previewRaw);
                 const prismWrapped = `<pre class="preview"><code class="language-${lang}">${escapedPreview}</code></pre>`;
 
@@ -254,9 +327,9 @@ body{margin:0; background:var(--bg); color:var(--text); font:13px/1.5 ui-sans-se
   position:relative;
   display:flex; align-items:center;
   background:#20252f; border:1px solid var(--border); border-radius:999px; padding:4px 8px;
-  flex: 1 1 520px;             /* prefers ~520px but can shrink/grow */
-  min-width: 260px;            /* never smaller than this */
-  max-width: 720px;            /* never larger than this */
+  flex: 1 1 520px;
+  min-width: 260px;
+  max-width: 720px;
 }
 input[type="text"]{flex:1; font-size:14px; color:var(--text); background:transparent; border:0; outline:0; padding:6px 6px}
 .kbdHint{color:var(--muted); font-size:11.5px; margin-left:6px; white-space:nowrap}
@@ -312,13 +385,12 @@ li.result:hover{background:rgba(255,255,255,0.03)}
 li.result.selected{background:rgba(97,175,239,0.12); outline:1px solid rgba(97,175,239,.4)}
 .line{width:56px; min-width:56px; text-align:right; color:var(--accent); font-variant-numeric:tabular-nums; padding-top:1px}
 
-/* keep long lines from pushing layout */
+/* keep exact whitespace for code previews */
 .preview{
   flex:1;
-  white-space: pre-wrap;
-  word-break: break-word;
-  overflow-wrap: anywhere;
-  line-break: anywhere;
+  white-space: pre;          /* newlines + indentation preserved */
+  word-break: normal;
+  overflow-wrap: normal;
   font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, "Courier New", monospace;
   font-size:12.5px;
   max-width: 100%;
@@ -326,12 +398,19 @@ li.result.selected{background:rgba(97,175,239,0.12); outline:1px solid rgba(97,1
 mark{background-color:var(--mark-bg); color:var(--mark-fg); padding:0 2px; border-radius:3px}
 .state{color:var(--muted); padding:20px 6px}
 .small{font-size:11.5px; color:var(--muted)}
-pre[class*="language-"], code[class*="language-"]{
-  background:none !important; margin:0 !important; padding:0 !important; line-height:1.35 !important;
-  white-space: inherit !important;
-  overflow-wrap: inherit !important;
-  word-break: inherit !important;
+pre[class*="language-"],
+code[class*="language-"]{
+  background:none !important;
+  margin:0 !important;
+  padding:0 !important;
+  line-height:1.35 !important;
+
+  /* Force exact whitespace even if Prism/token styles interfere */
+  white-space: pre !important;     /* was: inherit */
+  overflow-wrap: normal !important;
+  word-break: normal !important;
 }
+
 </style>
 </head>
 <body>
@@ -608,19 +687,22 @@ window.addEventListener('message', event => {
 
 
 async function enrichWithContext(records: { uri: vscode.Uri; line: number; preview?: string }[]) {
-  const fileContentCache = new Map<string, string>();
+  const cache = new Map<string, string>(); // fsPath -> text
+
   for (const rec of records) {
-    const path = rec.uri.fsPath;
-    if (!fileContentCache.has(path)) {
+    const p = rec.uri.fsPath;
+    if (!cache.has(p)) {
       try {
         const doc = await vscode.workspace.openTextDocument(rec.uri);
-        fileContentCache.set(path, doc.getText());
+        cache.set(p, doc.getText());
       } catch {
-        fileContentCache.set(path, '');
+        cache.set(p, '');
       }
     }
-    const text = fileContentCache.get(path) ?? '';
-    rec.preview = getContextPreview(text, rec.line, 2, 2);
+
+    const text = cache.get(p) || '';
+    // 2 lines before/after the hit; normalize newlines
+    rec.preview = getContextPreview(text, rec.line, 2, 2).replace(/\r\n?/g, '\n');
   }
   return records;
 }
