@@ -9,19 +9,93 @@ const COMMANDS = {
   bindF: 'searchEverywhere.bindCmdShiftF',
 } as const;
 
-type Scope = 'workspace' | 'open' | 'current';
+type Scope = 'workspace' | 'open' | 'current' | 'node_modules';
+
 
 // ---- fast search globals ----
 let currentSearchCts: vscode.CancellationTokenSource | undefined;
-const MAX_RESULTS = 500;                 // keep UI snappy
+let searchSeq = 0; // 🆕 monotonically increasing id per search
+const MAX_RESULTS = 500;
 const MAX_FILE_BYTES = 2_000_000;        // skip giant files (> ~2MB)
 const decoder = new TextDecoder('utf-8'); // reuse across files
+const EXT_GLOB = '*.{ts,js,json,tsx,jsx,html,css,scss,md,txt}';
+const SCAN_CONCURRENCY = 16;
+const NODE_EXT_GLOB = '*.{ts,tsx,js,jsx}';
+const NODE_EXCLUDE = '{**/node_modules/**/{dist,build,out,.bin,coverage,docs,examples}/**,**/*.min.* ,**/*.map,**/*.d.ts}';
+
+const hasFindTextInFiles = (): boolean =>
+  typeof (vscode.workspace as any).findTextInFiles === 'function';
+
+
+async function tryFindInFilesBuiltin(
+  scope: Scope,
+  q: string,
+  flags: { case?: boolean; regex?: boolean; word?: boolean },
+  limit = MAX_RESULTS,
+  token?: vscode.CancellationToken
+): Promise<{ uri: vscode.Uri; line: number; preview?: string }[]> {
+  const fn = (vscode.workspace as any).findTextInFiles;
+  if (typeof fn !== 'function') throw new Error('builtin search not available');
+
+  const results: { uri: vscode.Uri; line: number; preview?: string }[] = [];
+
+  const query = {
+    pattern: q,
+    isRegExp: !!flags.regex,
+    isCaseSensitive: !!flags.case,
+    isWordMatch: !!flags.word,
+  };
+
+  const include =
+    scope === 'node_modules'
+      ? `**/node_modules/**/${EXT_GLOB}`
+      : `**/${EXT_GLOB}`;
+
+  const exclude =
+    scope === 'workspace'
+      ? '**/{node_modules,.git,dist,build,out}/**'
+      : undefined;
+
+  const options = {
+    include,
+    exclude,
+    useIgnoreFiles: true,
+    useGlobalIgnoreFiles: true,
+    useDefaultExcludes: true,
+    maxResults: limit,
+  };
+
+  const ret = fn(
+    query as any,
+    options as any,
+    (res: any) => {
+      const r = Array.isArray(res.ranges) ? res.ranges[0] : res.ranges;
+      const line = Number(r?.start?.line ?? 0);
+      results.push({ uri: res.uri, line });
+      if (results.length >= limit) {
+        try { token?.isCancellationRequested || currentSearchCts?.cancel(); } catch { }
+      }
+    },
+    token
+  );
+
+  // חשוב: אם אין then → נופלים לפאלבק
+  if (!ret || typeof ret.then !== 'function') {
+    throw new Error('builtin search returned non-thenable');
+  }
+
+  await ret; // לחכות לסיום החיפוש
+  return results;
+}
+
+
 
 /* tiny, isolated scope helper */
 async function getUrisByScope(scope: Scope): Promise<vscode.Uri[]> {
   const strategies: Record<Scope, () => Promise<vscode.Uri[]>> = {
     async workspace() {
-      const includePattern = '**/*.{ts,js,json,tsx,jsx,html,css,scss,md,txt}';
+      // מוחרג node_modules כמו היום
+      const includePattern = `**/${EXT_GLOB}`;
       const excludePattern = '**/{node_modules,.git,dist,build,out}/**';
       return vscode.workspace.findFiles(includePattern, excludePattern, 20000);
     },
@@ -39,10 +113,18 @@ async function getUrisByScope(scope: Scope): Promise<vscode.Uri[]> {
     async current() {
       const u = vscode.window.activeTextEditor?.document?.uri;
       return u ? [u] : [];
+    },
+    async node_modules() {
+      const includePattern = '**/node_modules/**/*.{ts,tsx,js,jsx}';
+      return vscode.workspace.findFiles(includePattern, undefined, 50000);
     }
+
+
   };
   return strategies[scope]();
 }
+
+
 
 /* -------- fast FS scanner (no findTextInFiles) -------- */
 type Match = { uri: vscode.Uri; line: number; preview?: string };
@@ -61,44 +143,135 @@ function makeLineTester(source: string, flags: { case?: boolean }) {
   }
 }
 
+const YIELD_EVERY_MS = 25;
+const PER_FILE_LIMIT_NODE = 5;           // כמה התאמות מקס' מכל קובץ בתוך node_modules
+const MAX_FILE_BYTES_NODE = 600_000;     // קבצים גדולים במיוחד ב-node_modules – לדלג
+
+function isInNodeModulesPath(p: string) {
+  return /(^|[\\/])node_modules([\\/]|$)/i.test(p);
+}
+
+function slicePreview(lines: string[], hitLine: number, before = 2, after = 2) {
+  const start = Math.max(0, hitLine - before);
+  const end = Math.min(lines.length - 1, hitLine + after);
+  return lines.slice(start, end + 1).join('\n');
+}
+
 async function scanFilesFs(
   uris: vscode.Uri[],
   q: string,
   flags: { case?: boolean; regex?: boolean; word?: boolean },
   limit = MAX_RESULTS,
-  token?: vscode.CancellationToken
+  token?: vscode.CancellationToken,
+  onProgress?: (matchesCount: number, filesWithHits: number) => void, // ← NEW
 ): Promise<Match[]> {
   const matches: Match[] = [];
+  const seenFiles = new Set<string>(); // how many files produced at least one hit
+
   const source = buildSource(q, flags);
   const reTest = makeLineTester(source, flags);
-  if (!reTest) return matches; // invalid regex handled upstream
+  if (!reTest) return matches;
 
-  outer: for (const uri of uris) {
-    if (token?.isCancellationRequested) break;
+  let index = 0;
 
-    try {
-      const stat = await vscode.workspace.fs.stat(uri);
-      // skip huge files
-      if (typeof (stat as any).size === 'number' && (stat as any).size > MAX_FILE_BYTES) continue;
+  const worker = async () => {
+    let lastYield = Date.now();
 
-      const raw = await vscode.workspace.fs.readFile(uri);
-      const text = decoder.decode(raw);
-      const lines = text.split(/\r?\n/);
+    while (true) {
+      if (token?.isCancellationRequested) return;
+      if (matches.length >= limit) { currentSearchCts?.cancel(); return; }
 
-      for (let i = 0; i < lines.length; i++) {
-        if (token?.isCancellationRequested) break outer;
-        if (reTest.test(lines[i])) {
-          matches.push({ uri, line: i });
-          if (matches.length >= limit) break outer;
+      const i = index++;
+      if (i >= uris.length) return;
+
+      const uri = uris[i];
+      const inNode = isInNodeModulesPath(uri.fsPath);
+
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        const size = (stat as any).size as number | undefined;
+        if (typeof size === 'number') {
+          const maxSize = inNode ? MAX_FILE_BYTES_NODE : MAX_FILE_BYTES;
+          if (size > maxSize) continue;
         }
+
+        // 🔸 cheap path filters for node_modules noise
+        if (inNode) {
+          const p = uri.fsPath;
+          // heavy build dirs
+          if (/[\\/](dist|build|out|\.bin|coverage|docs|examples)[\\/]/i.test(p)) continue;
+          // files that rarely help
+          if (/\.d\.ts$/i.test(p) || /\.map$/i.test(p)) continue;
+        }
+
+        const raw = await vscode.workspace.fs.readFile(uri);
+        const text = decoder.decode(raw);
+
+        // 🔹 ultra-cheap prefilter for non-regex searches
+        if (!flags.regex) {
+          const needle = flags.case ? q : q.toLowerCase();
+          const hay = flags.case ? text : text.toLowerCase();
+          if (!hay.includes(needle)) {
+            if (Date.now() - lastYield > YIELD_EVERY_MS) {
+              await new Promise(r => setTimeout(r, 0));
+              lastYield = Date.now();
+            }
+            continue;
+          }
+        }
+
+        const lines = text.split(/\r?\n/);
+        let perFileHits = 0;
+        const perFileCap = inNode ? PER_FILE_LIMIT_NODE : Number.POSITIVE_INFINITY;
+        let fileCounted = false;
+
+        for (let line = 0; line < lines.length; line++) {
+          if (token?.isCancellationRequested) return;
+
+          if (reTest.test(lines[line])) {
+            matches.push({
+              uri,
+              line,
+              // build preview now to avoid re-opening later
+              preview: slicePreview(lines, line, 2, 2),
+            });
+
+            if (!fileCounted) {
+              seenFiles.add(uri.fsPath);
+              fileCounted = true;
+            }
+
+            // notify progress (caller throttles if needed)
+            onProgress?.(matches.length, seenFiles.size);
+
+            perFileHits++;
+            if (matches.length >= limit) { currentSearchCts?.cancel(); return; }
+            if (perFileHits >= perFileCap) break; // enough from this file
+          }
+
+          // small yield to keep UI responsive
+          if (Date.now() - lastYield > YIELD_EVERY_MS) {
+            await new Promise(r => setTimeout(r, 0));
+            lastYield = Date.now();
+          }
+        }
+      } catch {
+        // ignore IO/permission errors
       }
-    } catch {
-      // ignore unreadable files
     }
-  }
+  };
+
+  const runners = Array.from(
+    { length: Math.min(SCAN_CONCURRENCY, uris.length) },
+    () => worker()
+  );
+  await Promise.allSettled(runners);
 
   return matches;
 }
+
+
+
 
 export function activate(context: vscode.ExtensionContext) {
   // ----- OPEN CUSTOM SEARCH -----
@@ -131,55 +304,148 @@ export function activate(context: vscode.ExtensionContext) {
             const scope = ((m.scope as Scope) || 'workspace') as Scope;
 
             if (!q) {
+              const seq = ++searchSeq; // still advance so UI ignores older payloads
               panel.webview.postMessage({
                 type: 'renderResults',
-                payload: { total: 0, groups: [], flatIds: [], query: q }
+                payload: { total: 0, groups: [], flatIds: [], query: q, elapsed: 0, files: 0, seq }
               });
               return;
             }
 
-            // Build regex safely for non-workspace paths (open/current) and validation
+            const seq = ++searchSeq;                  // id for this search
+            const tStart = Date.now();
+
+            // throttle helper for progress messages
+            const throttle = <A extends any[]>(fn: (...a: A) => void, ms: number) => {
+              let last = 0;
+              return (...a: A) => {
+                const now = Date.now();
+                if (now - last >= ms) { last = now; fn(...a); }
+              };
+            };
+            const reportProgress = throttle((matchesCount: number, filesWithHits: number) => {
+              panel.webview.postMessage({
+                type: 'progress',
+                payload: { seq, matches: matchesCount, files: filesWithHits, elapsed: Date.now() - tStart }
+              });
+            }, 150);
+
+            // Build regex safely (also used for open/current path)
             let source = flags.regex ? q : escapeRegExp(q);
             if (flags.word) source = `\\b${source}\\b`;
             const baseFlags = flags.case ? '' : 'i';
             let reTest: RegExp;
             try {
-              reTest = new RegExp(source, baseFlags); // no 'g' for per-line testing
+              reTest = new RegExp(source, baseFlags); // no 'g'
             } catch {
               panel.webview.postMessage({
                 type: 'renderResults',
-                payload: { total: 0, groups: [], flatIds: [], query: q, error: 'Invalid regex' }
+                payload: { total: 0, groups: [], flatIds: [], query: q, error: 'Invalid regex', seq }
               });
               return;
             }
 
-            // cancel previous search (if any)
+            // cancel previous search
             currentSearchCts?.cancel();
             currentSearchCts = new vscode.CancellationTokenSource();
             const { token } = currentSearchCts;
 
-            let matches: { uri: vscode.Uri; line: number; preview?: string }[] = [];
-            try {
-              if (scope === 'workspace') {
-                const uris = await getUrisByScope('workspace');
-                matches = await scanFilesFs(uris, q, flags, MAX_RESULTS, token);
-              } else {
-                // fast enough for open/current via openTextDocument
-                const uris = await getUrisByScope(scope);
+            let matches: Match[] = []; // { uri, line, preview? }
 
+            try {
+              const uris = await getUrisByScope(scope);
+
+              // Try VS Code builtin (ripgrep); fall back to our FS scanner
+              const tryBuiltin = async (): Promise<Match[]> => {
+                const fn = (vscode.workspace as any).findTextInFiles;
+                if (typeof fn !== 'function') throw new Error('builtin unavailable');
+
+                const results: Match[] = [];
+                const seenFiles = new Set<string>();
+
+                const query = {
+                  pattern: q,
+                  isRegExp: !!flags.regex,
+                  isCaseSensitive: !!flags.case,
+                  isWordMatch: !!flags.word,
+                };
+
+                const include =
+                  scope === 'node_modules'
+                    ? `**/node_modules/**/${EXT_GLOB}`
+                    : `**/${EXT_GLOB}`;
+
+                const exclude =
+                  scope === 'workspace'
+                    ? '**/{node_modules,.git,dist,build,out}/**'
+                    : undefined;
+
+                const options = {
+                  include,
+                  exclude,
+                  useIgnoreFiles: true,
+                  useGlobalIgnoreFiles: true,
+                  useDefaultExcludes: true,
+                  maxResults: MAX_RESULTS,
+                };
+
+                const ret = fn(
+                  query as any,
+                  options as any,
+                  (res: any) => {
+                    const r = Array.isArray(res.ranges) ? res.ranges[0] : res.ranges;
+                    const line = Number(r?.start?.line ?? 0);
+                    results.push({ uri: res.uri, line });
+
+                    const p = res.uri?.fsPath ?? '';
+                    if (p && !seenFiles.has(p)) seenFiles.add(p);
+
+                    reportProgress(results.length, seenFiles.size);
+
+                    if (results.length >= MAX_RESULTS) {
+                      try { token?.isCancellationRequested || currentSearchCts?.cancel(); } catch { }
+                    }
+                  },
+                  token
+                );
+
+                if (!ret || typeof ret.then !== 'function') {
+                  throw new Error('builtin returned non-thenable');
+                }
+                await ret;
+                return results;
+              };
+
+              if (scope === 'workspace' || scope === 'node_modules') {
+                try {
+                  matches = await tryBuiltin();
+                } catch {
+                  // NOTE: scanFilesFs should accept the optional 6th arg (progress cb)
+                  // signature: (uris, q, flags, limit, token, onProgress?)
+                  matches = await scanFilesFs(uris, q, flags, MAX_RESULTS, token, reportProgress);
+                }
+              } else {
+                // open/current — per-line via openTextDocument (also emit progress)
+                const seenFiles = new Set<string>();
                 outer: for (const uri of uris) {
                   if (token.isCancellationRequested) break;
                   try {
                     const doc = await vscode.workspace.openTextDocument(uri);
                     const lines = doc.getText().split(/\r?\n/);
+                    let hadHitInThisFile = false;
                     for (let i = 0; i < lines.length; i++) {
                       if (token.isCancellationRequested) break outer;
                       if (reTest.test(lines[i])) {
                         matches.push({ uri, line: i });
+                        if (!hadHitInThisFile) {
+                          hadHitInThisFile = true;
+                          seenFiles.add(uri.fsPath);
+                        }
+                        reportProgress(matches.length, seenFiles.size);
                         if (matches.length >= MAX_RESULTS) break outer;
                       }
                     }
-                  } catch { /* ignore file errors */ }
+                  } catch { /* ignore */ }
                 }
               }
             } catch (e) {
@@ -191,6 +457,7 @@ export function activate(context: vscode.ExtensionContext) {
             await enrichWithContext(matches);
             lastResults = matches;
 
+            // group + HTML
             const groupsMap = new Map<
               string,
               { file: string; entries: { id: number; line: number; highlightedHtml: string }[] }
@@ -198,19 +465,21 @@ export function activate(context: vscode.ExtensionContext) {
             const flatIds: number[] = [];
 
             await Promise.all(
-              matches.map(async (m, i) => {
+              matches.map(async (m: Match, i: number) => {
                 const wsFolder = vscode.workspace.getWorkspaceFolder(m.uri);
                 const fileName = wsFolder
                   ? m.uri.fsPath.replace(wsFolder.uri.fsPath + '/', '')
                   : m.uri.fsPath;
 
-                const group = groupsMap.get(fileName) ?? { file: fileName, entries: [] };
-                const lang = detectLangFromFile(fileName);
+                const group =
+                  groupsMap.get(fileName) ??
+                  { file: fileName, entries: [] as { id: number; line: number; highlightedHtml: string }[] };
 
-                // No <mark> here; Prism first, then client-side marking
+                const lang = detectLangFromFile(fileName);
                 const previewRaw = (m.preview ?? '').replace(/\r\n?/g, '\n');
                 const escapedPreview = escapeHtml(previewRaw);
-                const prismWrapped = `<pre class="preview"><code class="language-${lang}">${escapedPreview}</code></pre>`;
+                const prismWrapped =
+                  '<pre class="preview"><code class="language-' + lang + '">' + escapedPreview + '</code></pre>';
 
                 group.entries.push({ id: i, line: m.line, highlightedHtml: prismWrapped });
                 groupsMap.set(fileName, group);
@@ -218,16 +487,23 @@ export function activate(context: vscode.ExtensionContext) {
               })
             );
 
+            const elapsed = Date.now() - tStart;
+            const fileCount = new Set(matches.map(m => m.uri.fsPath)).size;
+
             panel.webview.postMessage({
               type: 'renderResults',
               payload: {
                 total: matches.length,
                 groups: Array.from(groupsMap.values()),
                 flatIds,
-                query: q
+                query: q,
+                elapsed,
+                files: fileCount,
+                seq,
               }
             });
           },
+
 
           async openAt(m) {
             const idx = Number(m.id);
@@ -281,7 +557,7 @@ export function activate(context: vscode.ExtensionContext) {
     );
     const actions: Record<string, () => Thenable<void> | void> = {
       "Bind Now": () => vscode.commands.executeCommand(COMMANDS.bindF),
-      "Not Now": () => {}
+      "Not Now": () => { }
     };
     if (choice && actions[choice]) await actions[choice]();
   };
@@ -439,6 +715,7 @@ code[class*="language-"]{
             <option value="workspace" selected>Workspace</option>
             <option value="open">Open files</option>
             <option value="current">Current file</option>
+            <option value="node_modules">node_modules only</option>
           </select>
         </div>
 
@@ -488,6 +765,7 @@ const el = {
 let flatIndexToId = [];
 let selection = -1;
 let currentFlags = { case: false, regex: false, word: false };
+let latestSeq = 0; // 🆕 ignore out-of-order results
 
 /* ---- original chips logic kept (hidden) ---- */
 const toggles = [
@@ -513,8 +791,12 @@ const getFlags = () => {
       word: !!el.flagWord.checked
     };
   }
-  return Object.fromEntries(Array.from(el.chips.children).map(c => [c.dataset.key, c.dataset.active === 'true']));
+  return Object.fromEntries(
+    Array.from(el.chips.children).map(c => [c.dataset.key, c.dataset.active === 'true'])
+  );
 };
+
+
 
 const getScope = () => (el.scopeSelect && el.scopeSelect.value) ? el.scopeSelect.value : 'workspace';
 
@@ -604,47 +886,104 @@ function markAfterPrism(query){
 
 // render
 function renderResults(data){
+  // 🆕 Ignore stale searches
+  var hasSeq = typeof data.seq === 'number';
+  if (hasSeq) {
+    if (data.seq < latestSeq) return; // older payload, drop it
+    latestSeq = data.seq;             // record newest
+  }
+
   const started = t0();
-  const { total, groups, flatIds, query, error } = data;
+  const total   = data.total;
+  const groups  = data.groups;
+  const flatIds = data.flatIds;
+  const query   = data.query;
+  const error   = data.error;
+  const elapsed = data.elapsed; // ms from extension
+  const files   = data.files;   // file count from extension
+
   el.results.innerHTML = '';
   flatIndexToId = flatIds || [];
 
   if (error){
     el.results.innerHTML = '<div class="state">Invalid regex</div>';
-    el.counter.textContent = '0 results'; el.elapsed.textContent = ''; clearSelection(); return;
+    el.counter.textContent = '0 results';
+    el.elapsed.textContent = (typeof elapsed === 'number') ? (elapsed + ' ms') : '';
+    clearSelection();
+    return;
   }
   if (!total){
     el.results.innerHTML = '<div class="state">No results</div>';
-    el.counter.textContent = '0 results'; el.elapsed.textContent = ''; clearSelection(); return;
+    el.counter.textContent = '0 results' + (typeof files === 'number' ? (' · ' + files + ' files') : '');
+    el.elapsed.textContent = (typeof elapsed === 'number') ? (elapsed + ' ms') : '';
+    clearSelection();
+    return;
   }
 
-  const frag=document.createDocumentFragment();
-  groups.forEach(g => frag.appendChild(makeGroup(g)));
+  const frag = document.createDocumentFragment();
+  groups.forEach(function(g){ frag.appendChild(makeGroup(g)); });
   el.results.appendChild(frag);
 
-  Prism.highlightAll();     // 1) tokenize
-  markAfterPrism(query);    // 2) mark matches
+  Prism.highlightAll();
+markAfterPrism(query);
 
-  const first = document.querySelector('li.result');
-  first ? applySelection(0) : clearSelection();
+const first = document.querySelector('li.result');
+if (first) { applySelection(0); } else { clearSelection(); }
 
-  el.counter.textContent = total + (total===1 ? ' result' : ' results');
-  el.elapsed.textContent = fmtMs(started, performance.now());
-  setTimeout(()=>{ el.input.focus(); }, 20);
+// --- robust header computation (payload OR DOM fallback) ---
+const isNum = v => typeof v === 'number' && isFinite(v);
+
+// Count matches from payload OR from DOM (safe fallback)
+const domMatchCount = () => document.querySelectorAll('li.result').length;
+
+// Count unique files from payload groups OR from DOM (safer than groups.length if payload missing)
+const domFileCount = () => {
+  const files = new Set();
+  document.querySelectorAll('.groupHeader .file').forEach(el => files.add(el.textContent || ''));
+  return files.size;
+};
+
+const totalMatches = isNum(total) ? total : domMatchCount();
+const fileCount    = isNum(files) ? files : domFileCount();
+const elapsedText  = isNum(elapsed) ? (elapsed + ' ms') : fmtMs(started, performance.now());
+
+el.counter.textContent =
+  totalMatches + (totalMatches === 1 ? ' result' : ' results') +
+  ' · ' +
+  fileCount + (fileCount === 1 ? ' file' : ' files');
+
+el.elapsed.textContent = elapsedText;
+
+setTimeout(() => { el.input.focus(); }, 20);
 }
+
+
 
 // debounce + search
 let debounceTimer; const debounce = (fn,ms)=>(...a)=>{ clearTimeout(debounceTimer); debounceTimer=setTimeout(()=>fn(...a),ms); };
 
 const doSearch = () => {
   const q = el.input.value.trim();
-  if (!q){ el.results.innerHTML='<div class="state">Type to search…</div>'; el.counter.textContent='0 results'; el.elapsed.textContent=''; clearSelection(); return; }
-  el.results.innerHTML='<div class="state">Searching…</div>';
+  if (!q){
+    el.results.innerHTML = '<div class="state">Type to search…</div>';
+    el.counter.textContent = '0 results';
+    el.elapsed.textContent = '';
+    clearSelection();
+    return;
+  }
+  el.results.innerHTML = '<div class="state">Searching…</div>';
+
+  // 🔹 clear header for the new search immediately
+  el.counter.textContent = '…';
+  el.elapsed.textContent = '';
+
   currentFlags = getFlags(); // persist flags for marking step
   vscode.postMessage({ type:'doSearch', query:q, flags: currentFlags, scope: getScope() });
+
   const fm = document.getElementById('flagsMenu');
-  if (fm && 'open' in fm) { fm.open = false; } // close flags after search (if opened)
+  if (fm && 'open' in fm) { fm.open = false; }
 };
+
 
 el.input.addEventListener('input', debounce(doSearch, 300));
 el.btn.addEventListener('click', doSearch);
@@ -687,9 +1026,12 @@ window.addEventListener('message', event => {
 
 
 async function enrichWithContext(records: { uri: vscode.Uri; line: number; preview?: string }[]) {
-  const cache = new Map<string, string>(); // fsPath -> text
+  // אם כבר יש preview מהסריקה – לא עושים כלום
+  const need = records.filter(r => !r.preview);
+  if (need.length === 0) return records;
 
-  for (const rec of records) {
+  const cache = new Map<string, string>(); // fsPath -> text
+  for (const rec of need) {
     const p = rec.uri.fsPath;
     if (!cache.has(p)) {
       try {
@@ -699,13 +1041,12 @@ async function enrichWithContext(records: { uri: vscode.Uri; line: number; previ
         cache.set(p, '');
       }
     }
-
     const text = cache.get(p) || '';
-    // 2 lines before/after the hit; normalize newlines
     rec.preview = getContextPreview(text, rec.line, 2, 2).replace(/\r\n?/g, '\n');
   }
   return records;
 }
+
 
 function getContextPreview(text: string, line: number, before = 2, after = 2) {
   const lines = text.split(/\r?\n/);
@@ -742,4 +1083,4 @@ async function pickInitialQuery(editor?: vscode.TextEditor): Promise<string> {
   return v ? v.slice(0, 512) : '';
 }
 
-export function deactivate() {}
+export function deactivate() { }
