@@ -15,6 +15,7 @@ type Scope = 'workspace' | 'open' | 'current' | 'node_modules';
 // ---- fast search globals ----
 let currentSearchCts: vscode.CancellationTokenSource | undefined;
 let searchSeq = 0; // 🆕 monotonically increasing id per search
+let searchPanel: vscode.WebviewPanel | undefined;
 const MAX_RESULTS = 500;
 const MAX_FILE_BYTES = 2_000_000;        // skip giant files (> ~2MB)
 const decoder = new TextDecoder('utf-8'); // reuse across files
@@ -273,19 +274,34 @@ async function scanFilesFs(
 
 
 
+// NEW: Singleton handle מחוץ לפונקציה
 export function activate(context: vscode.ExtensionContext) {
   // ----- OPEN CUSTOM SEARCH -----
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.open, async () => {
+      // 👇 אם כבר פתוח — רק לחשוף ולפקס
+      if (searchPanel) {
+        searchPanel.reveal(undefined, false);
+        setTimeout(() => searchPanel!.webview.postMessage({ type: 'focusSearch' }), 40);
+        return;
+      }
+
+      const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
+
+      // 👇 אחרת — ליצור פעם אחת ולשמור את המופע הגלובלי
       const panel = vscode.window.createWebviewPanel(
         'searchEverywhereCustom',
         'Find in Files (Text Search)',
-        vscode.ViewColumn.Active,
+        { viewColumn: column, preserveFocus: false }, // שמור מיקום יציב, תן פוקוס לפאנל
         {
           enableScripts: true,
-          retainContextWhenHidden: false, // reset chips/flags each open
+          retainContextWhenHidden: true, // שימור מצב במקום רענון/הבזקים
         }
       );
+      searchPanel = panel;
+      panel.onDidDispose(() => (searchPanel = undefined));
+
+      await vscode.commands.executeCommand('workbench.action.pinEditor');
 
       let lastResults: { uri: vscode.Uri; line: number }[] = [];
       panel.webview.html = getWebviewHtml();
@@ -504,7 +520,6 @@ export function activate(context: vscode.ExtensionContext) {
             });
           },
 
-
           async openAt(m) {
             const idx = Number(m.id);
             if (!Number.isFinite(idx)) return;
@@ -563,6 +578,7 @@ export function activate(context: vscode.ExtensionContext) {
   };
   maybePromptTakeOver();
 }
+
 
 function getWebviewHtml(): string {
   return `<!DOCTYPE html>
