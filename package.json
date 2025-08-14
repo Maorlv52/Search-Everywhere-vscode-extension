@@ -9,15 +9,32 @@
     "type": "git",
     "url": "https://github.com/maorlevinshtein/search-everywhere-lite.git"
   },
-  "engines": { "vscode": "^1.85.0" },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
   "main": "./out/extension.js",
+  "activationEvents": [
+    "onCommand:searchEverywhere.openCustomSearch",
+    "onCommand:searchEverywhere.bindCmdShiftF"
+  ],
   "contributes": {
     "commands": [
-      { "command": "searchEverywhere.openCustomSearch", "title": "Search Everywhere: Open Custom Search (Text Search)" },
-      { "command": "searchEverywhere.bindCmdShiftF", "title": "Search Everywhere: Bind to ⌘⇧F (override Find in Files)" }
+      {
+        "command": "searchEverywhere.openCustomSearch",
+        "title": "Search Everywhere: Open Custom Search (Text Search)"
+      },
+      {
+        "command": "searchEverywhere.bindCmdShiftF",
+        "title": "Search Everywhere: Bind to ⌘⇧F (override Find in Files)"
+      }
     ],
     "keybindings": [
-      { "command": "searchEverywhere.openCustomSearch", "key": "cmd+shift+a", "mac": "cmd+shift+a", "when": "editorTextFocus || !editorIsOpen" }
+      {
+        "command": "searchEverywhere.openCustomSearch",
+        "key": "cmd+shift+a",
+        "mac": "cmd+shift+a",
+        "when": "true"
+      }
     ],
     "configuration": {
       "title": "Search Everywhere Lite",
@@ -37,11 +54,13 @@
     },
     "menus": {
       "commandPalette": [
-        { "command": "searchEverywhere.bindCmdShiftF", "when": "true", "group": "navigation@9" }
+        {
+          "command": "searchEverywhere.bindCmdShiftF",
+          "when": "true",
+          "group": "navigation@9"
+        }
       ]
     }
-
-    
   },
   "scripts": {
     "compile": "tsc -p ./",
