@@ -283,22 +283,26 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.open, async () => {
       // 👇 אם כבר פתוח — רק לחשוף ולפקס
+      const editor = vscode.window.activeTextEditor;
+      const initialQuery = await pickInitialQuery(editor);
+
       if (searchPanel) {
         searchPanel.reveal(undefined, false);
-        setTimeout(() => searchPanel!.webview.postMessage({ type: 'focusSearch' }), 40);
+        setTimeout(() => searchPanel!.webview.postMessage({ type: 'focusSearch', initialQuery }), 40);
         return;
       }
 
-      const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
+      const column = editor?.viewColumn ?? vscode.ViewColumn.One;
+
 
       // 👇 אחרת — ליצור פעם אחת ולשמור את המופע הגלובלי
       const panel = vscode.window.createWebviewPanel(
         'searchEverywhereCustom',
         'Find in Files (Text Search)',
-        { viewColumn: column, preserveFocus: false }, // שמור מיקום יציב, תן פוקוס לפאנל
+        { viewColumn: column, preserveFocus: false },
         {
           enableScripts: true,
-          retainContextWhenHidden: true, // שימור מצב במקום רענון/הבזקים
+          retainContextWhenHidden: true,
         }
       );
       searchPanel = panel;
@@ -309,10 +313,11 @@ export function activate(context: vscode.ExtensionContext) {
       let lastResults: { uri: vscode.Uri; line: number }[] = [];
       panel.webview.html = getWebviewHtml();
 
-      const editor = vscode.window.activeTextEditor;
-      const initialQuery = await pickInitialQuery(editor);
+      console.log('[SearchEverywhere] sending initialQuery:', initialQuery);
       panel.webview.postMessage({ type: 'init', initialQuery });
       setTimeout(() => panel.webview.postMessage({ type: 'focusSearch' }), 40);
+
+
 
       panel.webview.onDidReceiveMessage(async (msg) => {
         const routes: Record<string, (m: any) => Promise<void>> = {
@@ -1098,18 +1103,32 @@ window.addEventListener('message', event => {
   const table = {
     renderResults: () => renderResults(event.data.payload),
     init: () => {
-      renderChips(); // reset OFF (chips hidden)
+      renderChips();
       if (el.flagCase) el.flagCase.checked = false;
       if (el.flagRegex) el.flagRegex.checked = false;
       if (el.flagWord) el.flagWord.checked = false;
       if (el.scopeSelect) el.scopeSelect.value = 'workspace';
 
       const q = (event.data.initialQuery || '').toString();
-      if (q){ el.input.value = q; doSearch(); }
-      setTimeout(() => { el.input.focus(); q && el.input.select(); }, 20);
+      console.log('[SearchEverywhere:webview] got initialQuery:', q);
+
+
+      // always set input, even if empty
+      el.input.value = q;
+
+      if (q) doSearch();
+
+      setTimeout(() => {
+        el.input.focus();
+        if (q) el.input.select();
+      }, 40);
     },
-    focusSearch: () => { el.input.focus(); el.input.select(); },
-        scopeSet: () => {
+focusSearch: () => {
+  el.input.focus();
+  if (el.input.value) el.input.select();
+},
+       
+scopeSet: () => {
       if (el.scopeSelect) el.scopeSelect.value = (event.data.scope || 'workspace');
     },
      flagsSet: () => {
@@ -1187,12 +1206,24 @@ function detectLangFromFile(path: string): 'ts' | 'js' | 'json' {
   return 'ts';
 }
 
-// selection only
 async function pickInitialQuery(editor?: vscode.TextEditor): Promise<string> {
-  const getSelection = () =>
-    editor?.selections?.[0]?.isEmpty ? '' : (editor?.document.getText(editor.selection) ?? '');
-  const v = (await getSelection()).trim();
-  return v ? v.slice(0, 512) : '';
+  if (!editor) {
+    console.log('[SearchEverywhere] no active editor');
+    return '';
+  }
+
+  const texts = editor.selections
+    .filter(sel => !sel.isEmpty)
+    .map(sel => editor.document.getText(sel))
+    .filter(Boolean);
+
+  const selected = texts.join(' ') || '';
+  console.log('[SearchEverywhere] selection(s):', texts, 'final:', selected);
+
+  return selected.slice(0, 512);
 }
+
+
+
 
 export function deactivate() { }
